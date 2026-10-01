@@ -22,8 +22,10 @@ class BEAN_API UBeanPaletteItemWidget : public UUserWidget
 	GENERATED_BODY()
 
 public:
-	/** Configure before the widget is added to the viewport tree. */
-	void Setup(int32 InColorIndex, const FLinearColor& InColor, const FString& InName, UTexture2D* InIcon, float InItemWidth, float InItemHeight);
+	/** Configure before the widget is added to the viewport tree. InFaceCenter is the
+	 *  normalized centre of the cube's front face (from CreateCubeIconTexture), used to
+	 *  anchor the palette number onto the middle of the face. */
+	void Setup(int32 InColorIndex, const FLinearColor& InColor, const FString& InName, UTexture2D* InIcon, const FVector2D& InFaceCenter, float InItemWidth, float InItemHeight);
 
 	TFunction<void(int32)> OnClicked;
 
@@ -45,11 +47,14 @@ private:
 	UPROPERTY()
 	TObjectPtr<UTextBlock> Label = nullptr;
 	UPROPERTY()
+	TObjectPtr<UTextBlock> NumberLabel = nullptr;
+	UPROPERTY()
 	TObjectPtr<UBorder> Frame = nullptr;
 
 	int32 ColorIndex = 0;
 	FLinearColor Color = FLinearColor::White;
 	FString ColorName;
+	FVector2D FaceCenter = FVector2D(0.5f, 0.5f);
 	TObjectPtr<UTexture2D> IconTexture = nullptr;
 	float ItemWidth = 40.0f;
 	float ItemHeight = 66.0f;

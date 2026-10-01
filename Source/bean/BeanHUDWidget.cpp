@@ -28,12 +28,13 @@
 // UBeanPaletteItemWidget
 // ===========================================================================
 
-void UBeanPaletteItemWidget::Setup(int32 InColorIndex, const FLinearColor& InColor, const FString& InName, UTexture2D* InIcon, float InItemWidth, float InItemHeight)
+void UBeanPaletteItemWidget::Setup(int32 InColorIndex, const FLinearColor& InColor, const FString& InName, UTexture2D* InIcon, const FVector2D& InFaceCenter, float InItemWidth, float InItemHeight)
 {
 	ColorIndex = InColorIndex;
 	Color = InColor;
 	ColorName = InName;
 	IconTexture = InIcon;
+	FaceCenter = InFaceCenter;
 	ItemWidth = InItemWidth;
 	ItemHeight = InItemHeight;
 }
@@ -83,7 +84,26 @@ void UBeanPaletteItemWidget::BuildContent()
 		Icon->SetBrushFromTexture(IconTexture, false);
 		Icon->SetBrushSize(FVector2D(IconW, IconH));
 	}
-	IconBox->AddChild(Icon);
+
+	// CanvasPanel sized by the SizeBox above: the cube image fills it, and the 1..48
+	// palette number is anchored to the CENTRE of the cube's front face.
+	UCanvasPanel* IconCanvas = WidgetTree->ConstructWidget<UCanvasPanel>(UCanvasPanel::StaticClass(), TEXT("ItemIconCanvas"));
+	UCanvasPanelSlot* IconCanvasSlot = IconCanvas->AddChildToCanvas(Icon);
+	IconCanvasSlot->SetAnchors(FAnchors(0.0f, 0.0f, 1.0f, 1.0f));
+	IconCanvasSlot->SetOffsets(FMargin(0.0f));
+
+	NumberLabel = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("ItemNumber"));
+	NumberLabel->SetText(FText::FromString(FString::FromInt(ColorIndex + 1)));
+	NumberLabel->SetFont(FCoreStyle::GetDefaultFontStyle("Bold", 9));
+	NumberLabel->SetColorAndOpacity(FSlateColor(FLinearColor(1.0f, 1.0f, 1.0f, 0.85f)));
+	NumberLabel->SetShadowColorAndOpacity(FLinearColor(0.0f, 0.0f, 0.0f, 0.7f));
+	NumberLabel->SetShadowOffset(FVector2D(1.0f, 1.0f));
+	UCanvasPanelSlot* NumberSlot = IconCanvas->AddChildToCanvas(NumberLabel);
+	NumberSlot->SetAnchors(FAnchors(FaceCenter.X, FaceCenter.Y));
+	NumberSlot->SetAlignment(FVector2D(0.5f, 0.5f));
+	NumberSlot->SetAutoSize(true);
+
+	IconBox->AddChild(IconCanvas);
 	UVerticalBoxSlot* IconSlot = Content->AddChildToVerticalBox(IconBox);
 	IconSlot->SetHorizontalAlignment(HAlign_Center);
 	IconSlot->SetVerticalAlignment(VAlign_Top);
@@ -164,9 +184,10 @@ void UBeanHUDWidget::BuildUI()
 	UVerticalBox* Hints = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), TEXT("HintBox"));
 	const TCHAR* HintLines[] = {
 		TEXT("左键放置，右键移除。"),
-		TEXT("e键显示/隐藏ui界面。"),
-		TEXT("shift+f1，显示/隐藏鼠标。"),
-		TEXT("f键切换行走/飞行，space上升，左ctrl下降。"),
+		TEXT("长按左键/右键：持续放置/移除方块。"),
+		TEXT("E键显示/隐藏UI界面。"),
+		TEXT("Q键显示/隐藏鼠标。"),
+		TEXT("F键切换行走/飞行，空格上升，左Ctrl下降。"),
 		TEXT("F5 保存。"),
 	};
 	for (const TCHAR* Line : HintLines)
@@ -187,7 +208,7 @@ void UBeanHUDWidget::BuildUI()
 
 	// ---- version marker (top-right, lets you confirm which build is running) ----
 	UTextBlock* Version = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("VersionMarker"));
-	Version->SetText(FText::FromString(TEXT("Bean v4")));
+	Version->SetText(FText::FromString(TEXT("Bean v5")));
 	Version->SetFont(FCoreStyle::GetDefaultFontStyle("Regular", 12));
 	Version->SetColorAndOpacity(FSlateColor(FLinearColor(0.85f, 0.85f, 0.85f, 0.9f)));
 	Version->SetShadowColorAndOpacity(FLinearColor(0.0f, 0.0f, 0.0f, 0.9f));
@@ -359,8 +380,9 @@ void UBeanHUDWidget::BuildPaletteBar()
 		{
 			UBeanPaletteItemWidget* Item = CreateWidget<UBeanPaletteItemWidget>(GetWorld(), UBeanPaletteItemWidget::StaticClass());
 			if (!Item) continue;
-			UTexture2D* Icon = FBeanAssets::CreateCubeIconTexture(Palette[Index].Color);
-			Item->Setup(Index, Palette[Index].Color, Palette[Index].Name, Icon, ItemWidth, ItemHeight);
+			FVector2D FaceCenter;
+			UTexture2D* Icon = FBeanAssets::CreateCubeIconTexture(Palette[Index].Color, &FaceCenter);
+			Item->Setup(Index, Palette[Index].Color, Palette[Index].Name, Icon, FaceCenter, ItemWidth, ItemHeight);
 			Item->OnClicked = [this](int32 ColorIndex)
 			{
 				if (OnColorSelected)
@@ -463,9 +485,28 @@ void UBeanHUDWidget::HandleExitClicked()
 
 void UBeanHUDWidget::HandleToggleFullscreenClicked()
 {
-	UGameUserSettings* Settings = UGameUserSettings::GetGameUserSettings();
-	if (!Settings) return;
-	const bool bIsFullscreen = Settings->GetFullscreenMode() != EWindowMode::Windowed;
-	Settings->SetFullscreenMode(bIsFullscreen ? EWindowMode::Windowed : EWindowMode::Fullscreen);
-	Settings->ApplySettings(false);
+	UWorld* World = GetWorld();
+	UGameViewportClient* ViewportClient = World ? World->GetGameViewport() : nullptr;
+	if (!ViewportClient)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Bean] No game viewport client, cannot toggle fullscreen."));
+		return;
+	}
+
+	// Let the engine do it. Its own command is the only path that keeps the real viewport state
+	// (FViewport::IsFullscreen), FSystemResolution, the RHI swapchain and the saved user settings
+	// in step with each other, and it also re-derives a resolution that matches the monitor.
+	//
+	// Driving UGameUserSettings by hand instead desyncs them: the resolution request is then
+	// treated as a no-op (FSystemResolution::RequestResolutionChange skips requests that match its
+	// cached state), so the button appears dead, and once the window and the rendered viewport
+	// disagree the present is stretched - the blurry, corrupted-looking picture after a few clicks.
+	ViewportClient->HandleToggleFullscreenCommand();
+
+	// Switching window modes drops the OS mouse capture, so the game input mode has to be
+	// re-asserted or camera look and the HUD cursor stay wedged afterwards.
+	if (Controller)
+	{
+		Controller->ReapplyCursorMode();
+	}
 }

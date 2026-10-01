@@ -89,6 +89,10 @@ void ABeanGrid::BuildCubeInstancers()
 		{
 			Instancer->SetStaticMesh(CubeMesh);
 		}
+		// Cubes must not block the player/camera (no stepping up onto placed blocks — the
+		// player walks/flys straight through them), but they keep blocking the placement
+		// ray (Visibility channel) so aiming/removing stays precise.
+		Instancer->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
 		if (CubeMaterial)
 		{
 			UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(CubeMaterial, this);
@@ -370,14 +374,28 @@ void ABeanGrid::BeginImagePreview(const TArray<uint8>& QuantizedCells, int32 Gra
 	bHasOverlay = true;
 	bOverlayVisible = true;
 
-	// Build the palette-quantized overlay texture at granularity N: one texel per
-	// block, Nearest sampling upscales it onto the 256-cell plane as crisp blocks.
-	// This shows exactly the colours the cubes will use, at full opacity so the
-	// result is vivid and easy to read.
+	// Each block is painted with the palette colour it will be built with (the nearest of
+	// the 48 palette colors for that pixel of the compressed image), one block per grid
+	// cell. CreateOverlayTexture draws the blocks, a grid line on every block boundary and
+	// the 1-based palette number in each block's corner. Opacity is baked per-texel inside
+	// the texture (light blocks 0.8, dark blocks 1.0), so the global scalar starts at 1.0 —
+	// the "透明度±" slider still scales the whole layer from there.
+	OverlayOpacity = 1.0f;
+
+	// Palette colors in linear space, used to tint the blocks and their corner numbers.
+	TArray<FLinearColor> PaletteLinear;
+	PaletteLinear.Reserve(Palette.Num());
+	for (const FBeanPaletteColor& Item : Palette)
+	{
+		PaletteLinear.Add(Item.Color);
+	}
+
 	TArray<FLinearColor> CellColors;
-	CellColors.SetNum(N * N);
 	TArray<bool> HasCell;
+	TArray<int32> CellLabels;
+	CellColors.SetNum(N * N);
 	HasCell.SetNum(N * N);
+	CellLabels.SetNum(N * N);
 	for (int32 i = 0; i < N * N; ++i)
 	{
 		const uint8 ColorIndex = QuantizedCells[i];
@@ -385,18 +403,17 @@ void ABeanGrid::BeginImagePreview(const TArray<uint8>& QuantizedCells, int32 Gra
 		{
 			CellColors[i] = Palette[ColorIndex].Color;
 			HasCell[i] = true;
+			CellLabels[i] = static_cast<int32>(ColorIndex) + 1;
 		}
 		else
 		{
 			CellColors[i] = FLinearColor::Black;
 			HasCell[i] = false;
+			CellLabels[i] = 0;
 		}
 	}
 
-	// Fully opaque overlay so even dark / uniform images stay clearly visible.
-	OverlayOpacity = 1.0f;
-
-	OverlayTexture = FBeanAssets::CreateOverlayTexture(CellColors, HasCell, N);
+	OverlayTexture = FBeanAssets::CreateOverlayTexture(CellColors, HasCell, CellLabels, N, PaletteLinear);
 	if (OverlayMID)
 	{
 		OverlayMID->SetTextureParameterValue(TEXT("OverlayTex"), OverlayTexture);
@@ -404,9 +421,8 @@ void ABeanGrid::BeginImagePreview(const TArray<uint8>& QuantizedCells, int32 Gra
 	}
 	if (OverlayMesh)
 	{
-		// The overlay texture is always 256x256 (image data in its center), so the
-		// plane always spans the full grid. Center the N x N data by writing it to
-		// the texture's center (done in CreateOverlayTexture).
+		// The overlay texture spans the full grid (one cell per block, data centered),
+		// so the plane always covers the whole grid.
 		OverlayMesh->SetWorldScale3D(FVector(GridSize * CellSize / 100.0f, GridSize * CellSize / 100.0f, 1.0f));
 		OverlayMesh->SetRelativeLocation(FVector(0.0f, 0.0f, 1.0f)); // centered, just above ground
 		OverlayMesh->SetVisibility(bOverlayVisible);

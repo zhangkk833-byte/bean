@@ -29,6 +29,10 @@ public:
 	void ToggleOverlayVisible();
 	void CycleColor(int32 Delta);
 	void SetCurrentColor(int32 Index);
+	/** Re-assert the current mouse-cursor/input mode. The 全屏 button and the import picker both
+	 *  hand the OS focus around, which drops the mouse capture and otherwise leaves camera look
+	 *  and the HUD cursor wedged. */
+	void ReapplyCursorMode() { ApplyCursorMode(); }
 
 protected:
 	virtual void BeginPlay() override;
@@ -45,13 +49,19 @@ private:
 	bool IsClickOverHUD() const;
 	/** Modal window asking the user to pick a preview granularity (32/64/128/256). Returns the choice, or 0 if cancelled. */
 	int32 PromptGranularity();
+	/** Deferred import step: run the native file picker, then load the chosen image. */
+	void OpenImportPicker();
 
 	// -- input handlers ---------------------------------------------------
 	void OnMoveForward(const FInputActionValue& Value);
 	void OnMoveRight(const FInputActionValue& Value);
 	void OnLook(const FInputActionValue& Value);
 	void OnPlace(const FInputActionValue& Value);
+	void OnPlaceHeld(const FInputActionValue& Value);
+	void OnPlaceReleased(const FInputActionValue& Value);
 	void OnRemove(const FInputActionValue& Value);
+	void OnRemoveHeld(const FInputActionValue& Value);
+	void OnRemoveReleased(const FInputActionValue& Value);
 	void OnCycleColor(const FInputActionValue& Value);
 	void OnToggleFly(const FInputActionValue& Value);
 	void OnFlyUp(const FInputActionValue& Value);
@@ -59,6 +69,10 @@ private:
 	void OnToggleCursor(const FInputActionValue& Value);
 	void OnToggleUI(const FInputActionValue& Value);
 	void OnSave(const FInputActionValue& Value);
+
+	/** While a button is held, act on every cell swept from the last acted cell to (ToX, ToY). */
+	void SweepPlace(int32 ToX, int32 ToY);
+	void SweepRemove(int32 ToX, int32 ToY);
 
 	UPROPERTY()
 	TObjectPtr<UInputMappingContext> MappingContext = nullptr;
@@ -101,5 +115,22 @@ private:
 	bool bFlyUpHeld = false;
 	bool bFlyDownHeld = false;
 
-	float LookSensitivity = 0.5f;
+	// -- held place/remove state (continuous sweep placement) ---------------
+	/** Last grid cell acted on while the button is held (-1 = none). */
+	int32 LastPlaceCellX = -1;
+	int32 LastPlaceCellY = -1;
+	int32 LastRemoveCellX = -1;
+	int32 LastRemoveCellY = -1;
+	/** True when the current press started in pointer (cursor) mode and was consumed by
+	 *  exiting it — the rest of that press must not place/remove (Q2). */
+	bool bPlacePressConsumed = false;
+	bool bRemovePressConsumed = false;
+
+	// -- deferred import flow ----------------------------------------------
+	/** True while the deferred import flow is pending or its file picker is open, so a second
+	 *  click on 导入图片 cannot queue a second dialog. Cleared as soon as the picker returns. */
+	bool bImportPickerOpen = false;
+
+	// ~1000 eDPI at 800 DPI (mouse sensitivity tuned for faster look).
+	float LookSensitivity = 1.25f;
 };

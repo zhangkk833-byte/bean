@@ -73,9 +73,12 @@ public:
 	void SetGhostVisible(bool bVisible);
 
 	// -- image preview overlay ------------------------------------------------
-	/** Show the semi-transparent-capped overlay for the given quantized cells (255 = transparent/skip).
-	 *  Granularity is the preview resolution (32/64/128/256): the image is split into
-	 *  Granularity x Granularity blocks, each covering (256/Granularity) cells. */
+	/** Project the palette-quantized imported image onto the ground as a hint layer.
+	 *  QuantizedCells holds the palette index per block (255 = empty) — the image was
+	 *  compressed to Granularity x Granularity and each pixel snapped to the nearest of the
+	 *  48 palette colors. The overlay magnifies each pixel onto one centre grid cell and
+	 *  paints it with that palette color, slightly translucent, divided by grid lines and
+	 *  labeled with its 1-based palette number. */
 	void BeginImagePreview(const TArray<uint8>& QuantizedCells, int32 Granularity);
 	/** Build the whole grid from the pending preview cells. */
 	void ApplyImage();

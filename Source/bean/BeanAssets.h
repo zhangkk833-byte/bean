@@ -31,8 +31,16 @@ public:
 	// ---- Textures (always created at runtime; safe for packaged builds) ----
 	static UTexture2D* CreateGridTexture();
 	static UTexture2D* CreateCrosshairTexture();
-	/** Small fake-3D cube icon for the palette bar. */
-	static UTexture2D* CreateCubeIconTexture(const FLinearColor& Color, int32 IconSize = 64);
-	/** Granularity x Granularity overlay texture (N = 32/64/128/256); HasCell[i] false = transparent. Colors are linear-space palette colors. */
-	static UTexture2D* CreateOverlayTexture(const TArray<FLinearColor>& CellColors, const TArray<bool>& HasCell, int32 Granularity);
+	/** Small fake-3D cube icon for the palette bar. If OutFrontFaceCenter is set it receives
+	 *  the normalized (0..1) centre of the cube's front face so a label can be anchored there. */
+	static UTexture2D* CreateCubeIconTexture(const FLinearColor& Color, FVector2D* OutFrontFaceCenter = nullptr, int32 IconSize = 64);
+	/** Full-grid hint-layer texture showing the Granularity x Granularity downscaled image in
+	 *  the centre: one block per ground cell, painted with its palette color, with a grid line
+	 *  along every block boundary. CellLabels[i] (1-based palette number, 0 = none) is drawn
+	 *  small in the bottom-right corner of each block (size/stroke fixed, no outline) in the
+	 *  opposite shade of the block fill — near-black on light blocks, near-white on dark ones,
+	 *  near-opaque so it stays readable at any hint-layer opacity. HasCell[i] false leaves the
+	 *  block transparent (its grid lines are still drawn). */
+	static UTexture2D* CreateOverlayTexture(const TArray<FLinearColor>& CellColors, const TArray<bool>& HasCell,
+		const TArray<int32>& CellLabels, int32 Granularity, const TArray<FLinearColor>& PaletteColors);
 };

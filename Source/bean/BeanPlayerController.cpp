@@ -3,6 +3,7 @@
 #include "BeanCharacter.h"
 #include "BeanGrid.h"
 #include "BeanHUDWidget.h"
+#include "Engine/World.h"
 #if PLATFORM_WINDOWS
 #include "Windows/AllowWindowsPlatformTypes.h"
 #include <windows.h>
@@ -25,10 +26,13 @@
 #include "InputCoreTypes.h"
 #include "InputMappingContext.h"
 #include "InputModifiers.h"
+#include "Misc/Paths.h"
+#include "TimerManager.h"
 #include "Kismet/GameplayStatics.h"
 #include "Framework/Application/SlateUser.h"
 #include "Widgets/SWidget.h"
 #include "Widgets/SWindow.h"
+#include "GenericPlatform/GenericWindow.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Input/SButton.h"
@@ -36,6 +40,54 @@
 #include "Widgets/Layout/SGridPanel.h"
 #include "Widgets/SOverlay.h"
 #include "Styling/CoreStyle.h"
+
+#if PLATFORM_WINDOWS
+namespace
+{
+	/**
+	 * Native HWND of the window currently hosting the game: the PIE window when playing in the
+	 * editor, or the standalone/packaged game window. The Win32 common dialog must be owned by
+	 * that window, otherwise it is a plain top-level window that ends up hidden behind it.
+	 */
+	HWND GetBeanGameWindowHandle(UWorld* World)
+	{
+		if (World)
+		{
+			if (UGameViewportClient* Viewport = World->GetGameViewport())
+			{
+				if (TSharedPtr<SWindow> Window = Viewport->GetWindow())
+				{
+					if (TSharedPtr<FGenericWindow> NativeWindow = Window->GetNativeWindow())
+					{
+						if (void* Handle = NativeWindow->GetOSWindowHandle())
+						{
+							return static_cast<HWND>(Handle);
+						}
+					}
+				}
+			}
+		}
+
+		// Fallback: whatever Slate currently considers the active window (e.g. a non-game viewport).
+		if (FSlateApplication::IsInitialized())
+		{
+			if (TSharedPtr<SWindow> ActiveWindow = FSlateApplication::Get().GetActiveTopLevelWindow())
+			{
+				if (TSharedPtr<FGenericWindow> NativeWindow = ActiveWindow->GetNativeWindow())
+				{
+					if (void* Handle = NativeWindow->GetOSWindowHandle())
+					{
+						return static_cast<HWND>(Handle);
+					}
+				}
+			}
+		}
+
+		return ::GetActiveWindow();
+	}
+
+}
+#endif // PLATFORM_WINDOWS
 
 ABeanPlayerController::ABeanPlayerController()
 {
@@ -117,7 +169,7 @@ void ABeanPlayerController::BindEnhancedInput()
 	MappingContext->MapKey(IA_FlyDown, EKeys::LeftControl);
 
 	IA_ToggleCursor = MakeAction(TEXT("IA_ToggleCursor"), EInputActionValueType::Boolean);
-	MappingContext->MapKey(IA_ToggleCursor, EKeys::F1);
+	MappingContext->MapKey(IA_ToggleCursor, EKeys::Q);
 
 	IA_ToggleUI = MakeAction(TEXT("IA_ToggleUI"), EInputActionValueType::Boolean);
 	MappingContext->MapKey(IA_ToggleUI, EKeys::E);
@@ -129,7 +181,11 @@ void ABeanPlayerController::BindEnhancedInput()
 	EIC->BindAction(IA_MoveRight, ETriggerEvent::Triggered, this, &ABeanPlayerController::OnMoveRight);
 	EIC->BindAction(IA_Look, ETriggerEvent::Triggered, this, &ABeanPlayerController::OnLook);
 	EIC->BindAction(IA_Place, ETriggerEvent::Started, this, &ABeanPlayerController::OnPlace);
+	EIC->BindAction(IA_Place, ETriggerEvent::Triggered, this, &ABeanPlayerController::OnPlaceHeld);
+	EIC->BindAction(IA_Place, ETriggerEvent::Completed, this, &ABeanPlayerController::OnPlaceReleased);
 	EIC->BindAction(IA_Remove, ETriggerEvent::Started, this, &ABeanPlayerController::OnRemove);
+	EIC->BindAction(IA_Remove, ETriggerEvent::Triggered, this, &ABeanPlayerController::OnRemoveHeld);
+	EIC->BindAction(IA_Remove, ETriggerEvent::Completed, this, &ABeanPlayerController::OnRemoveReleased);
 	EIC->BindAction(IA_CycleColor, ETriggerEvent::Started, this, &ABeanPlayerController::OnCycleColor);
 	EIC->BindAction(IA_ToggleFly, ETriggerEvent::Started, this, &ABeanPlayerController::OnToggleFly);
 	EIC->BindAction(IA_FlyUp, ETriggerEvent::Started, this, &ABeanPlayerController::OnFlyUp);
@@ -304,10 +360,15 @@ void ABeanPlayerController::OnLook(const FInputActionValue& Value)
 
 void ABeanPlayerController::OnPlace(const FInputActionValue& Value)
 {
-	// In cursor mode (Shift+F1), clicking empty space exits cursor mode instead
-	// of placing; clicks on UI (buttons / palette cubes) are handled by Slate.
+	if (!Grid) return;
+
 	if (bShowMouseCursor)
 	{
+		// Pointer mode: this press is consumed (exit cursor on empty space), so the
+		// remaining hold cannot start placing. The next press after release will.
+		bPlacePressConsumed = true;
+		LastPlaceCellX = -1;
+		LastPlaceCellY = -1;
 		if (!IsClickOverHUD())
 		{
 			bShowMouseCursor = false;
@@ -315,15 +376,83 @@ void ABeanPlayerController::OnPlace(const FInputActionValue& Value)
 		}
 		return;
 	}
-	if (!bTargetValid || !Grid) return;
-	Grid->PlaceCell(TargetX, TargetY);
+
+	// Normal (game) mode: place on the current cell, then keep sweeping while held.
+	bPlacePressConsumed = false;
+	LastPlaceCellX = -1;
+	LastPlaceCellY = -1;
+	if (bTargetValid)
+	{
+		SweepPlace(TargetX, TargetY);
+	}
+}
+
+void ABeanPlayerController::OnPlaceHeld(const FInputActionValue& Value)
+{
+	// Continuous placement while the left button stays down.
+	if (bShowMouseCursor || bPlacePressConsumed) return;
+	if (!bTargetValid)
+	{
+		LastPlaceCellX = -1;
+		LastPlaceCellY = -1;
+		return;
+	}
+	if (LastPlaceCellX == TargetX && LastPlaceCellY == TargetY) return;
+	SweepPlace(TargetX, TargetY);
+}
+
+void ABeanPlayerController::OnPlaceReleased(const FInputActionValue& Value)
+{
+	bPlacePressConsumed = false;
+	LastPlaceCellX = -1;
+	LastPlaceCellY = -1;
+}
+
+void ABeanPlayerController::SweepPlace(int32 ToX, int32 ToY)
+{
+	if (!Grid || !Grid->IsValidCell(ToX, ToY))
+	{
+		LastPlaceCellX = -1;
+		LastPlaceCellY = -1;
+		return;
+	}
+
+	if (LastPlaceCellX < 0 || LastPlaceCellY < 0)
+	{
+		Grid->PlaceCell(ToX, ToY);
+	}
+	else
+	{
+		// Step through every cell between the last acted cell and the current target so a
+		// fast drag paints a solid line instead of leaving gaps.
+		const int32 Dx = ToX - LastPlaceCellX;
+		const int32 Dy = ToY - LastPlaceCellY;
+		const int32 Steps = FMath::Max(FMath::Abs(Dx), FMath::Abs(Dy));
+		for (int32 i = 1; i <= Steps; ++i)
+		{
+			const float T = static_cast<float>(i) / static_cast<float>(Steps);
+			const int32 X = LastPlaceCellX + FMath::RoundToInt(Dx * T);
+			const int32 Y = LastPlaceCellY + FMath::RoundToInt(Dy * T);
+			if (Grid->IsValidCell(X, Y))
+			{
+				Grid->PlaceCell(X, Y);
+			}
+		}
+	}
+
+	LastPlaceCellX = ToX;
+	LastPlaceCellY = ToY;
 }
 
 void ABeanPlayerController::OnRemove(const FInputActionValue& Value)
 {
-	// Same cursor-mode rule as OnPlace: empty-space clicks hide the cursor, never remove.
+	if (!Grid) return;
+
 	if (bShowMouseCursor)
 	{
+		bRemovePressConsumed = true;
+		LastRemoveCellX = -1;
+		LastRemoveCellY = -1;
 		if (!IsClickOverHUD())
 		{
 			bShowMouseCursor = false;
@@ -331,8 +460,68 @@ void ABeanPlayerController::OnRemove(const FInputActionValue& Value)
 		}
 		return;
 	}
-	if (!bTargetValid || !Grid) return;
-	Grid->RemoveCell(TargetX, TargetY);
+
+	bRemovePressConsumed = false;
+	LastRemoveCellX = -1;
+	LastRemoveCellY = -1;
+	if (bTargetValid)
+	{
+		SweepRemove(TargetX, TargetY);
+	}
+}
+
+void ABeanPlayerController::OnRemoveHeld(const FInputActionValue& Value)
+{
+	if (bShowMouseCursor || bRemovePressConsumed) return;
+	if (!bTargetValid)
+	{
+		LastRemoveCellX = -1;
+		LastRemoveCellY = -1;
+		return;
+	}
+	if (LastRemoveCellX == TargetX && LastRemoveCellY == TargetY) return;
+	SweepRemove(TargetX, TargetY);
+}
+
+void ABeanPlayerController::OnRemoveReleased(const FInputActionValue& Value)
+{
+	bRemovePressConsumed = false;
+	LastRemoveCellX = -1;
+	LastRemoveCellY = -1;
+}
+
+void ABeanPlayerController::SweepRemove(int32 ToX, int32 ToY)
+{
+	if (!Grid || !Grid->IsValidCell(ToX, ToY))
+	{
+		LastRemoveCellX = -1;
+		LastRemoveCellY = -1;
+		return;
+	}
+
+	if (LastRemoveCellX < 0 || LastRemoveCellY < 0)
+	{
+		Grid->RemoveCell(ToX, ToY);
+	}
+	else
+	{
+		const int32 Dx = ToX - LastRemoveCellX;
+		const int32 Dy = ToY - LastRemoveCellY;
+		const int32 Steps = FMath::Max(FMath::Abs(Dx), FMath::Abs(Dy));
+		for (int32 i = 1; i <= Steps; ++i)
+		{
+			const float T = static_cast<float>(i) / static_cast<float>(Steps);
+			const int32 X = LastRemoveCellX + FMath::RoundToInt(Dx * T);
+			const int32 Y = LastRemoveCellY + FMath::RoundToInt(Dy * T);
+			if (Grid->IsValidCell(X, Y))
+			{
+				Grid->RemoveCell(X, Y);
+			}
+		}
+	}
+
+	LastRemoveCellX = ToX;
+	LastRemoveCellY = ToY;
 }
 
 void ABeanPlayerController::OnCycleColor(const FInputActionValue& Value)
@@ -394,8 +583,7 @@ void ABeanPlayerController::OnFlyDown(const FInputActionValue& Value)
 
 void ABeanPlayerController::OnToggleCursor(const FInputActionValue& Value)
 {
-	// Only toggle when Shift is held (Shift+F1), per spec.
-	if (!FSlateApplication::Get().GetModifierKeys().IsShiftDown()) return;
+	// Q toggles the mouse cursor (show/hide).
 	bShowMouseCursor = !bShowMouseCursor;
 	ApplyCursorMode();
 }
@@ -422,22 +610,79 @@ void ABeanPlayerController::OnSave(const FInputActionValue& Value)
 
 void ABeanPlayerController::ImportImage()
 {
-	if (!Grid) return;
+	if (!Grid || bImportPickerOpen) return;
 
 #if PLATFORM_WINDOWS
-	// DesktopPlatform is a non-redistributable engine module and cannot be referenced
-	// from packaged game targets, so use the Windows native file dialog instead.
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	// The picker is a blocking Win32 modal loop, so it must not be opened from inside the Slate
+	// button callback: Slate would be frozen mid-tick with the button still held down. Hand the
+	// real work to the next tick instead.
+	bImportPickerOpen = true;
+	World->GetTimerManager().SetTimerForNextTick(FTimerDelegate::CreateUObject(this, &ABeanPlayerController::OpenImportPicker));
+#else
+	// Image import currently uses a Windows-only native file dialog.
+	UE_LOG(LogTemp, Warning, TEXT("[Bean] ImportImage is only supported on Windows."));
+#endif
+}
+
+#if PLATFORM_WINDOWS
+void ABeanPlayerController::OpenImportPicker()
+{
+	// DesktopPlatform is a non-redistributable engine module and cannot be referenced from packaged
+	// game targets, so use the Windows native file dialog instead.
+	//
+	// The game window is deliberately NOT restyled while the picker is up: changing the window mode
+	// makes the engine recreate the swapchain and re-resolve the viewport, which throws away the
+	// frame the user is looking at (the picture collapses to the bare clear colour). Owning the
+	// dialog by the game window is enough to keep it on top, and it leaves the scene untouched.
+	UWorld* World = GetWorld();
+	const HWND OwnerHandle = GetBeanGameWindowHandle(World);
+
+	if (OwnerHandle)
+	{
+		// Owned windows always sit above their owner, but a topmost owner would still win. The game
+		// window is never topmost in practice, so this is a no-op restyle - it just makes the
+		// guarantee unconditional without disturbing the scene.
+		::SetWindowPos(OwnerHandle, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+	}
+
 	WCHAR FileBuffer[MAX_PATH] = {};
 	OPENFILENAMEW Ofn;
 	FMemory::Memzero(Ofn);
 	Ofn.lStructSize = sizeof(OPENFILENAMEW);
-	Ofn.hwndOwner = nullptr;
+	// Owning the picker by the game window is what keeps it visible: an ownerless common dialog is
+	// a plain top-level window and Windows is free to leave it behind the game window.
+	// Do NOT set OFN_ENABLEHOOK/OFN_ENABLETEMPLATE here: requesting a hook or a custom template
+	// makes Windows fall back to the legacy (pre-Vista) dialog, and the explorer-style picker is
+	// exactly what we want. The dialog is a normal Windows file browser, matching the OS look.
+	Ofn.hwndOwner = OwnerHandle;
 	Ofn.lpstrFilter = TEXT("图片文件 (*.png;*.jpg;*.jpeg;*.bmp)\0*.png;*.jpg;*.jpeg;*.bmp\0所有文件 (*.*)\0*.*\0\0");
 	Ofn.lpstrFile = FileBuffer;
 	Ofn.nMaxFile = MAX_PATH;
 	Ofn.lpstrTitle = TEXT("选择要导入的图片");
-	Ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
-	if (!GetOpenFileNameW(&Ofn))
+	// nFilterIndex is 1-based; 0 would leave the filter combo box unset.
+	Ofn.nFilterIndex = 1;
+	// OFN_NOCHANGEDIR keeps the game's working directory intact while the user browses elsewhere.
+	Ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_EXPLORER | OFN_NOCHANGEDIR;
+
+	const BOOL bPicked = GetOpenFileNameW(&Ofn);
+
+	// Hand the foreground back to the game before doing anything else.
+	if (OwnerHandle)
+	{
+		::SetForegroundWindow(OwnerHandle);
+	}
+	// Closing the picker also drops the OS mouse capture, so re-assert the game's input mode or
+	// camera look and the HUD cursor stay wedged.
+	ApplyCursorMode();
+
+	// The modal loop is behind us and nothing below can re-enter the UI, so the latch that keeps a
+	// second 导入图片 click from queueing a second dialog can be released now.
+	bImportPickerOpen = false;
+
+	if (!bPicked)
 	{
 		return;
 	}
@@ -463,49 +708,79 @@ void ABeanPlayerController::ImportImage()
 	FImage SrcBGRA;
 	Source.CopyTo(SrcBGRA, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
 
+	// Precompute the palette in CIE L*a*b*: sRGB is not perceptually uniform, and
+	// matching in Lab stops colors from being mispicked (dark red vs brown etc.).
+	TArray<FVector3f> LabPalette;
+	FBeanPalette::BuildLabPalette(Grid->Palette, LabPalette);
+
+	// 1) Compress the whole image down to the chosen resolution (Granularity x Granularity).
 	FImage Resized;
 	SrcBGRA.ResizeTo(Resized, Granularity, Granularity, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
 
+	// 2) Snap every resized pixel to the nearest of the 48 palette colours (in Lab), so the
+	//    hint layer shows exactly the colours the blocks will be built with. Pixels with a
+	//    transparent alpha are skipped (nothing is placed there).
 	const int32 Count = Granularity * Granularity;
-	const FColor* Data = reinterpret_cast<const FColor*>(Resized.RawData.GetData());
-
 	TArray<uint8> Quantized;
 	Quantized.SetNum(Count);
+	const FColor* ResizedPixels = reinterpret_cast<const FColor*>(Resized.RawData.GetData());
 	for (int32 i = 0; i < Count; ++i)
 	{
-		const FColor Pixel = Data[i];
-		if (Pixel.A < 128)
+		const FColor& Px = ResizedPixels[i];
+		if (Px.A < 128)
 		{
-			Quantized[i] = ABeanGrid::EmptyCell; // transparent: skip
+			Quantized[i] = ABeanGrid::EmptyCell;
+			continue;
 		}
-		else
-		{
-			const FLinearColor Linear = FLinearColor::FromSRGBColor(Pixel);
-			Quantized[i] = static_cast<uint8>(Grid->NearestColorIndex(Linear));
-		}
+		Quantized[i] = static_cast<uint8>(FBeanPalette::NearestColorIndexLab(LabPalette, Px));
 	}
 
+	// 3) Each pixel will be magnified to one grid cell of the hint layer (and of Apply).
 	Grid->BeginImagePreview(Quantized, Granularity);
-	UE_LOG(LogTemp, Log, TEXT("[Bean] Imported image '%s' at %dx%d, %d non-empty cells."), *FilePath, Granularity, Granularity, Count);
+	UE_LOG(LogTemp, Log, TEXT("[Bean] Imported image '%s' compressed to %dx%d, %d blocks."), *FilePath, Granularity, Granularity, Quantized.Num());
 	if (HUDWidget)
 	{
 		HUDWidget->SetImportButtonsEnabled(true);
 	}
-#else
-	// Image import currently uses a Windows-only native file dialog.
-	UE_LOG(LogTemp, Warning, TEXT("[Bean] ImportImage is only supported on Windows."));
-#endif
 }
+#endif // PLATFORM_WINDOWS
 
 int32 ABeanPlayerController::PromptGranularity()
 {
 	const int32 Options[] = { 32, 64, 128, 256 };
 	int32 Result = 0; // 0 = cancelled
 
-	// Store the modal result in the game viewport client's parent window reference.
-	const TSharedPtr<SWindow> ParentWindow = GetWorld() && GetWorld()->GetGameViewport()
-		? GetWorld()->GetGameViewport()->GetWindow()
-		: nullptr;
+	UGameViewportClient* ViewportClient = GetWorld() ? GetWorld()->GetGameViewport() : nullptr;
+	const TSharedPtr<SWindow> ParentWindow = ViewportClient ? ViewportClient->GetWindow() : nullptr;
+
+	// The dialog is laid out in Slate units, which do not grow with the display. PIE runs in a
+	// 1280x720 window, so the same 1.0x layout reads as a comfortable panel there; a packaged build
+	// runs at the monitor's native height and the identical panel looks tiny. Scale the whole thing
+	// by the viewport-height ratio (Slate units, i.e. the viewport's pixel height divided by the
+	// window's DPI factor) against that 720-unit-tall reference so it reads at the size it did in
+	// the editor. GetViewportSize() reports pixels; if it is not available yet, stay at 1.0x.
+	float UIScale = 1.0f;
+	{
+		FVector2D ViewportSize = FVector2D::ZeroVector;
+		if (ViewportClient)
+		{
+			ViewportClient->GetViewportSize(ViewportSize);
+		}
+
+		const float DpiScale = ParentWindow.IsValid() ? FMath::Max(ParentWindow->GetDPIScaleFactor(), 0.01f) : 1.0f;
+		if (ViewportSize.Y > 0.0f)
+		{
+			UIScale = FMath::Clamp(static_cast<float>(ViewportSize.Y) / DpiScale / 720.0f, 1.0f, 2.5f);
+		}
+	}
+
+	// Every size below is expressed for the 720-unit reference layout and then scaled up.
+	const float GridPad = FMath::RoundToFloat(6.0f * UIScale);
+	const float OuterPad = FMath::RoundToFloat(12.0f * UIScale);
+	const float ButtonPadX = FMath::RoundToFloat(18.0f * UIScale);
+	const float ButtonPadY = FMath::RoundToFloat(10.0f * UIScale);
+	const float MinButtonWidth = FMath::RoundToFloat(110.0f * UIScale);
+	const FSlateFontInfo ButtonFont = FCoreStyle::GetDefaultFontStyle("Bold", FMath::RoundToFloat(16.0f * UIScale));
 
 	const TSharedRef<SWindow> Window = SNew(SWindow)
 		.Title(FText::FromString(TEXT("选择提示层大小")))
@@ -522,10 +797,13 @@ int32 ABeanPlayerController::PromptGranularity()
 	{
 		const int32 Opt = Options[i];
 		SizeGrid->AddSlot(i % 2, i / 2)
-			.Padding(6.0f)
+			.Padding(GridPad)
 			[
 				SNew(SButton)
 				.ButtonStyle(&FCoreStyle::Get().GetWidgetStyle<FButtonStyle>("Button"))
+				.ContentPadding(FMargin(ButtonPadX, ButtonPadY))
+				.HAlign(HAlign_Center)
+				.VAlign(VAlign_Center)
 				.OnClicked_Lambda([&Result, &Window, Opt]()
 				{
 					Result = Opt;
@@ -533,21 +811,29 @@ int32 ABeanPlayerController::PromptGranularity()
 					return FReply::Handled();
 				})
 				[
-					SNew(STextBlock)
-					.Text(FText::FromString(FString::Printf(TEXT("%d × %d"), Opt, Opt)))
-					.Justification(ETextJustify::Center)
+					SNew(SBox)
+					.MinDesiredWidth(MinButtonWidth)
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(FString::Printf(TEXT("%d × %d"), Opt, Opt)))
+						.Font(ButtonFont)
+						.Justification(ETextJustify::Center)
+					]
 				]
 			];
 	}
-	MainBox->AddSlot().AutoHeight().Padding(12.0f, 12.0f, 12.0f, 0.0f)[SizeGrid];
+	MainBox->AddSlot().AutoHeight().Padding(OuterPad, OuterPad, OuterPad, 0.0f)[SizeGrid];
 
-	MainBox->AddSlot().AutoHeight().Padding(12.0f, 8.0f, 12.0f, 12.0f)
+	MainBox->AddSlot().AutoHeight().Padding(OuterPad, FMath::RoundToFloat(8.0f * UIScale), OuterPad, OuterPad)
 	[
 		SNew(SHorizontalBox)
 		+ SHorizontalBox::Slot().FillWidth(1.0f)
 		[
 			SNew(SButton)
 			.ButtonStyle(&FCoreStyle::Get().GetWidgetStyle<FButtonStyle>("Button"))
+			.ContentPadding(FMargin(ButtonPadX, ButtonPadY))
+			.HAlign(HAlign_Center)
+			.VAlign(VAlign_Center)
 			.OnClicked_Lambda([&Result, &Window]()
 			{
 				Result = 0;
@@ -557,6 +843,7 @@ int32 ABeanPlayerController::PromptGranularity()
 			[
 				SNew(STextBlock)
 				.Text(FText::FromString(TEXT("取消")))
+				.Font(ButtonFont)
 				.Justification(ETextJustify::Center)
 			]
 		]

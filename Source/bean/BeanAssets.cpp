@@ -319,7 +319,7 @@ UTexture2D* FBeanAssets::CreateCrosshairTexture()
 	return Texture;
 }
 
-UTexture2D* FBeanAssets::CreateCubeIconTexture(const FLinearColor& Color, int32 IconSize)
+UTexture2D* FBeanAssets::CreateCubeIconTexture(const FLinearColor& Color, FVector2D* OutFrontFaceCenter, int32 IconSize)
 {
 	const int32 Size = FMath::Max(16, IconSize);
 	FImage Image(Size, Size, 1, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
@@ -330,14 +330,20 @@ UTexture2D* FBeanAssets::CreateCubeIconTexture(const FLinearColor& Color, int32 
 	}
 
 	// A standard cube: a large square FRONT face plus narrow top and right faces
-	// that lean up-and-right. Short lean keeps the whole silhouette square (1:1)
-	// instead of looking tall and thin.
-	const float Half = Size * 0.36f;    // front face half size (square)
-	const float LeanX = Size * 0.13f;   // top/right faces lean right
-	const float LeanY = Size * 0.13f;   // top/right faces lean up
+	// that lean up-and-right. The front face is 25% bigger than before; the lean is
+	// kept small so the enlarged silhouette still fits inside the square texture.
+	const float Half = Size * 0.45f;    // front face half size (square)
+	const float LeanX = Size * 0.08f;   // top/right faces lean right
+	const float LeanY = Size * 0.08f;   // top/right faces lean up
 	// Center the whole silhouette (right/up lean is asymmetric, so nudge the front).
 	const float Cx = Size * 0.5f - LeanX * 0.5f;
 	const float Cy = Size * 0.5f + LeanY * 0.5f;
+	if (OutFrontFaceCenter)
+	{
+		// Normalized centre of the front face, so callers can anchor a label onto it.
+		OutFrontFaceCenter->X = Cx / Size;
+		OutFrontFaceCenter->Y = Cy / Size;
+	}
 
 	// Front face corners (a square).
 	const FVector2D F_TL(Cx - Half, Cy - Half);
@@ -387,7 +393,9 @@ UTexture2D* FBeanAssets::CreateCubeIconTexture(const FLinearColor& Color, int32 
 		}
 	}
 
-	// Crisp outer outline: any opaque pixel adjacent to a transparent one.
+	// Crisp outer outline: any opaque pixel adjacent to a transparent one. Neighbour reads
+	// are bounds-checked: the cube can touch the texture border, and reading one texel
+	// outside the image buffer crashed packaged builds (access violation).
 	for (int32 Y = MinY; Y <= MaxY; ++Y)
 	{
 		for (int32 X = MinX; X <= MaxX; ++X)
@@ -395,10 +403,10 @@ UTexture2D* FBeanAssets::CreateCubeIconTexture(const FLinearColor& Color, int32 
 			FColor& C = Data[Y * Size + X];
 			if (C.A == 0) continue;
 			const bool bEdge =
-				Data[Y * Size + (X - 1)].A == 0 ||
-				Data[Y * Size + (X + 1)].A == 0 ||
-				Data[(Y - 1) * Size + X].A == 0 ||
-				Data[(Y + 1) * Size + X].A == 0;
+				(X > 0 && Data[Y * Size + (X - 1)].A == 0) ||
+				(X < Size - 1 && Data[Y * Size + (X + 1)].A == 0) ||
+				(Y > 0 && Data[(Y - 1) * Size + X].A == 0) ||
+				(Y < Size - 1 && Data[(Y + 1) * Size + X].A == 0);
 			if (bEdge) C = Outline;
 		}
 	}
@@ -413,13 +421,16 @@ UTexture2D* FBeanAssets::CreateCubeIconTexture(const FLinearColor& Color, int32 
 	return Texture;
 }
 
-UTexture2D* FBeanAssets::CreateOverlayTexture(const TArray<FLinearColor>& CellColors, const TArray<bool>& HasCell, int32 Granularity)
+UTexture2D* FBeanAssets::CreateOverlayTexture(const TArray<FLinearColor>& CellColors, const TArray<bool>& HasCell,
+	const TArray<int32>& CellLabels, int32 Granularity, const TArray<FLinearColor>& PaletteColors)
 {
-	// Always build a full 256x256 texture so sampling behavior is identical at every
-	// granularity (a small N x N texture enlarged near the camera made the preview
-	// flicker/alias). The N x N data is written into the CENTER of the texture.
-	constexpr int32 Size = 256;
-	const int32 N = FMath::Clamp(Granularity, 1, Size);
+	// Full-grid texture: TexelsPerCell texels per ground cell leaves room for crisp 1-texel
+	// grid lines between the N x N blocks AND for a small palette-number label in each corner.
+	constexpr int32 CellsPerSide = 256;
+	constexpr int32 TexelsPerCell = 24;
+	constexpr int32 Size = CellsPerSide * TexelsPerCell; // 6144
+	const int32 N = FMath::Clamp(Granularity, 1, CellsPerSide);
+
 	FImage Image(Size, Size, 1, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
 	FColor* Data = reinterpret_cast<FColor*>(Image.RawData.GetData());
 
@@ -429,17 +440,118 @@ UTexture2D* FBeanAssets::CreateOverlayTexture(const TArray<FLinearColor>& CellCo
 		Data[i] = FColor(0, 0, 0, 0);
 	}
 
-	const int32 Start = (Size - N) / 2;
-	for (int32 Y = 0; Y < N; ++Y)
+	// Opacity is baked per texel: the grid lines and LIGHT blocks keep their previous look
+	// (alpha 204 = 0.8 effective at the default layer opacity), while DARK blocks (perceived
+	// brightness <= 0.35, e.g. black / dark brown) are baked fully opaque so their colour can
+	// still be told apart from the ground. The "透明度±" slider still scales the whole layer.
+	constexpr uint8 LightAlpha = 204; // 0.8
+	constexpr uint8 DarkAlpha = 255;  // 1.0
+	constexpr float DarkLuminanceMax = 0.35f;
+	const FColor Line(35, 35, 35, LightAlpha);
+	const int32 CellStart = (CellsPerSide - N) / 2;
+
+	for (int32 Ty = 0; Ty < Size; ++Ty)
 	{
-		for (int32 X = 0; X < N; ++X)
+		const int32 GY = Ty / TexelsPerCell;
+		const int32 iy = Ty % TexelsPerCell;
+		if (GY < CellStart || GY >= CellStart + N) continue;
+		const int32 By = GY - CellStart;
+
+		for (int32 Tx = 0; Tx < Size; ++Tx)
 		{
-			const int32 Src = Y * N + X;
+			const int32 GX = Tx / TexelsPerCell;
+			const int32 ix = Tx % TexelsPerCell;
+			if (GX < CellStart || GX >= CellStart + N) continue;
+			const int32 Bx = GX - CellStart;
+
+			// Grid: each block's top/left edge plus the region's outer right/bottom frame.
+			const bool bGrid = (ix == 0 || iy == 0)
+				|| (GX == CellStart + N - 1 && ix == TexelsPerCell - 1)
+				|| (GY == CellStart + N - 1 && iy == TexelsPerCell - 1);
+			if (bGrid)
+			{
+				Data[Ty * Size + Tx] = Line;
+				continue;
+			}
+
+			const int32 Src = By * N + Bx;
 			if (Src < HasCell.Num() && HasCell[Src] && Src < CellColors.Num())
 			{
 				FColor C = CellColors[Src].ToFColor(true);
-				C.A = 255;
-				Data[(Start + Y) * Size + (Start + X)] = C;
+				const float Lum = (0.2126f * C.R + 0.7152f * C.G + 0.0722f * C.B) / 255.0f;
+				C.A = (Lum <= DarkLuminanceMax) ? DarkAlpha : LightAlpha;
+				Data[Ty * Size + Tx] = C;
+			}
+		}
+	}
+
+	// ---- palette-number labels (bottom-right corner of each block) ----
+	// Tiny 3x5 digit font, drawn without an outline, size/stroke unchanged. The glyphs always
+	// use the opposite shade of the block fill (near-black on light blocks, near-white on dark
+	// ones) so they stay readable even on pale hint blocks, and are baked near-opaque so they
+	// stay visible at any hint-layer opacity.
+	static const char* const DigitGlyphs[10] = {
+		"111101101101111", // 0
+		"010110010010111", // 1
+		"111001111100111", // 2
+		"111001111001111", // 3
+		"101101111001001", // 4
+		"111100111001111", // 5
+		"111100111101111", // 6
+		"111001010010010", // 7
+		"111101111101111", // 8
+		"111101111001111", // 9
+	};
+	constexpr int32 FontW = 3;
+	constexpr int32 FontH = 5;
+	constexpr int32 FontPitch = 4; // 3 + 1 gap
+	constexpr int32 TextRight = TexelsPerCell - 3;  // local column of the last digit's right edge
+	constexpr int32 TextBottom = TexelsPerCell - 3; // local row of the last font row
+
+	for (int32 By = 0; By < N; ++By)
+	{
+		const int32 Oy = (CellStart + By) * TexelsPerCell;
+		for (int32 Bx = 0; Bx < N; ++Bx)
+		{
+			const int32 Src = By * N + Bx;
+			if (Src >= CellLabels.Num() || Src >= HasCell.Num() || !HasCell[Src]) continue;
+			const int32 Label = CellLabels[Src];
+			if (Label < 1 || Label > PaletteColors.Num()) continue;
+
+			// Opposite-shade digits: near-black over light blocks, near-white over dark ones.
+			FColor Core(245, 245, 245, 250);
+			if (Src < CellColors.Num())
+			{
+				const FColor Fill = CellColors[Src].ToFColor(true);
+				const float FillLum = (0.2126f * Fill.R + 0.7152f * Fill.G + 0.0722f * Fill.B) / 255.0f;
+				Core = (FillLum > 0.5f) ? FColor(10, 10, 10, 250) : FColor(250, 250, 250, 250);
+			}
+
+			char Buffer[3];
+			int32 NumDigits = 0;
+			if (Label >= 10)
+			{
+				Buffer[NumDigits++] = static_cast<char>('0' + (Label / 10));
+			}
+			Buffer[NumDigits++] = static_cast<char>('0' + (Label % 10));
+
+			const int32 Ox = (CellStart + Bx) * TexelsPerCell;
+			const int32 TotalW = NumDigits * FontPitch - 1;
+			const int32 StartX = Ox + TextRight - (TotalW - 1);
+			const int32 StartY = Oy + TextBottom - (FontH - 1);
+
+			for (int32 D = 0; D < NumDigits; ++D)
+			{
+				const char* G = DigitGlyphs[Buffer[D] - '0'];
+				const int32 GlyphX = StartX + D * FontPitch;
+				for (int32 Row = 0; Row < FontH; ++Row)
+				{
+					for (int32 Col = 0; Col < FontW; ++Col)
+					{
+						if (G[Row * FontW + Col] != '1') continue;
+						Data[(StartY + Row) * Size + (GlyphX + Col)] = Core;
+					}
+				}
 			}
 		}
 	}
