@@ -18,6 +18,35 @@ namespace
 	const TCHAR* OverlayMaterialPath = TEXT("/Game/Bean/M_BeanOverlay");
 	const TCHAR* GhostMaterialPath = TEXT("/Game/Bean/M_BeanGhost");
 
+	/**
+	 * Shared ground grid textures, one per canvas cell count (X in the low 16 bits of the key, Y in
+	 * the high 16). File scope (not a function-local static) so ResetCache() can drop them all.
+	 * Rooted while alive, so a raw pointer is safe here.
+	 */
+	TMap<uint32, TObjectPtr<UTexture2D>> BeanGridTextureCache;
+	/** Keys of BeanGridTextureCache in least-recently-used order (front = oldest). */
+	TArray<uint32> BeanGridTextureCacheOrder;
+	/**
+	 * How many grid textures to keep alive. The biggest is 64MB (256 cells), the smallest 1MB, and
+	 * a canvas only ever needs one, so a small window is enough to make switching shapes free
+	 * without letting the cache grow with every size the player tries.
+	 */
+	constexpr int32 BeanGridTextureCacheLimit = 2;
+
+	/** Unroot and forget every cached grid texture. */
+	void DropGridTextureCache()
+	{
+		for (const TPair<uint32, TObjectPtr<UTexture2D>>& Pair : BeanGridTextureCache)
+		{
+			if (Pair.Value)
+			{
+				Pair.Value->RemoveFromRoot();
+			}
+		}
+		BeanGridTextureCache.Reset();
+		BeanGridTextureCacheOrder.Reset();
+	}
+
 #if WITH_EDITOR
 	enum class EBeanMaterialKind
 	{
@@ -171,7 +200,9 @@ UMaterial* FBeanAssets::GetGhostMaterial()
 
 void FBeanAssets::ResetCache()
 {
-	// No persistent cache: each Get*() re-resolves LoadObject / rebuilds.
+	// No persistent material cache: each Get*() re-resolves LoadObject / rebuilds.
+	// The shared grid textures are dropped here too, so the next CreateGridTexture() rebuilds them.
+	DropGridTextureCache();
 }
 #else
 // Packaged builds cannot construct materials at runtime (editor-only APIs), so
@@ -199,6 +230,7 @@ UMaterial* FBeanAssets::GetGhostMaterial()
 
 void FBeanAssets::ResetCache()
 {
+	DropGridTextureCache();
 }
 #endif // WITH_EDITOR
 
@@ -240,13 +272,35 @@ bool FBeanAssets::BakeAssets()
 // Textures (runtime-created; safe for packaged builds)
 // ---------------------------------------------------------------------------
 
-UTexture2D* FBeanAssets::CreateGridTexture()
+UTexture2D* FBeanAssets::CreateGridTexture(int32 CellsX, int32 CellsY)
 {
-	// 8192x8192 over a 64m plane => 0.25m per cell, 32 texels per cell.
-	// A 1-texel line is therefore ~0.8cm => very thin grid lines.
-	constexpr int32 Size = 8192;
-	constexpr int32 CellTexels = 32; // 32 texels = 0.25m (one grid cell)
-	FImage Image(Size, Size, 1, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
+	// One square per cell, 16 texels each (so a 256-cell canvas is the original 4096x4096 over a
+	// 64m plane = 0.25m per cell) and smaller canvases get a proportionally smaller texture instead
+	// of the same picture stretched over fewer cells.
+	const int32 CellsXClamped = FMath::Clamp(CellsX, 1, 1024);
+	const int32 CellsYClamped = FMath::Clamp(CellsY, 1, 1024);
+	constexpr int32 CellTexels = 16;
+	const int32 SizeX = FMath::Clamp(CellsXClamped * CellTexels, 64, 4096);
+	const int32 SizeY = FMath::Clamp(CellsYClamped * CellTexels, 64, 4096);
+	const uint32 Key = ((uint32)CellsXClamped << 16) | (uint32)CellsYClamped;
+
+	// Generated once per canvas shape: the image is immutable, and building it per grid actor used
+	// to cost ~200ms plus a large transient allocation on every spawn/resize.
+	if (TObjectPtr<UTexture2D>* Cached = BeanGridTextureCache.Find(Key))
+	{
+		// Touch it, so the LRU keeps whatever the player is actually using.
+		BeanGridTextureCacheOrder.Remove(Key);
+		BeanGridTextureCacheOrder.Add(Key);
+		return *Cached;
+	}
+	// Only ever build it on the game thread: CreateTexture2DFromImage creates a UObject, and a
+	// non-game-thread call would trip the object-creation guard.
+	if (!IsInGameThread())
+	{
+		return nullptr;
+	}
+
+	FImage Image(SizeX, SizeY, 1, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
 	FColor* Data = reinterpret_cast<FColor*>(Image.RawData.GetData());
 
 	// Warm off-white ground with a very subtle warm-gray grid line.
@@ -254,12 +308,12 @@ UTexture2D* FBeanAssets::CreateGridTexture()
 	const FColor Line(220, 216, 205);
 	const FColor Border(196, 192, 182);
 
-	for (int32 Y = 0; Y < Size; ++Y)
+	for (int32 Y = 0; Y < SizeY; ++Y)
 	{
-		for (int32 X = 0; X < Size; ++X)
+		for (int32 X = 0; X < SizeX; ++X)
 		{
 			FColor C = Fill;
-			if (X == 0 || Y == 0 || X == Size - 1 || Y == Size - 1)
+			if (X == 0 || Y == 0 || X == SizeX - 1 || Y == SizeY - 1)
 			{
 				C = Border;
 			}
@@ -267,7 +321,7 @@ UTexture2D* FBeanAssets::CreateGridTexture()
 			{
 				C = Line;
 			}
-			Data[Y * Size + X] = C;
+			Data[Y * SizeX + X] = C;
 		}
 	}
 
@@ -279,6 +333,26 @@ UTexture2D* FBeanAssets::CreateGridTexture()
 		Texture->AddressX = TA_Clamp;
 		Texture->AddressY = TA_Clamp;
 		Texture->UpdateResource();
+
+		// Rooted so the shared instance survives the garbage collector; ResetCache() unroots it.
+		Texture->AddToRoot();
+		BeanGridTextureCache.Add(Key, Texture);
+		BeanGridTextureCacheOrder.Add(Key);
+		while (BeanGridTextureCacheOrder.Num() > BeanGridTextureCacheLimit)
+		{
+			const uint32 Oldest = BeanGridTextureCacheOrder[0];
+			BeanGridTextureCacheOrder.RemoveAt(0);
+			if (TObjectPtr<UTexture2D>* Evicted = BeanGridTextureCache.Find(Oldest))
+			{
+				// Only the cache's own reference goes away: whoever is using it holds a reference
+				// through their material instance, so an eviction can never pull a live texture.
+				if (*Evicted)
+				{
+					(*Evicted)->RemoveFromRoot();
+				}
+				BeanGridTextureCache.Remove(Oldest);
+			}
+		}
 	}
 	return Texture;
 }
@@ -422,20 +496,33 @@ UTexture2D* FBeanAssets::CreateCubeIconTexture(const FLinearColor& Color, FVecto
 }
 
 UTexture2D* FBeanAssets::CreateOverlayTexture(const TArray<FLinearColor>& CellColors, const TArray<bool>& HasCell,
-	const TArray<int32>& CellLabels, int32 Granularity, const TArray<FLinearColor>& PaletteColors)
+	const TArray<int32>& CellLabels, int32 InWidth, int32 InHeight, const TArray<FLinearColor>& PaletteColors)
 {
-	// Full-grid texture: TexelsPerCell texels per ground cell leaves room for crisp 1-texel
-	// grid lines between the N x N blocks AND for a small palette-number label in each corner.
-	constexpr int32 CellsPerSide = 256;
-	constexpr int32 TexelsPerCell = 24;
-	constexpr int32 Size = CellsPerSide * TexelsPerCell; // 6144
-	const int32 N = FMath::Clamp(Granularity, 1, CellsPerSide);
+	// One texel block per ground cell over the WHOLE canvas, so the hint layer can cover any
+	// canvas shape (square, landscape or portrait) with the plane simply scaled to match.
+	const int32 CellsX = FMath::Clamp(InWidth, 1, 1024);
+	const int32 CellsY = FMath::Clamp(InHeight, 1, 1024);
 
-	FImage Image(Size, Size, 1, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
+	// TexelsPerCell leaves room for crisp 1-texel grid lines between the blocks AND for a small
+	// palette-number label in each block's corner. The budget keeps a 256x256 canvas at 6144 texels
+	// per side (a power-of-two-friendly 36 MB texture), and larger ones get proportionally coarser
+	// blocks rather than a texture the GPU cannot hold.
+	constexpr int32 TargetTexelsPerSide = 6144;
+	constexpr int32 MinTexelsPerCell = 8;
+	const int32 TexelsPerCell = FMath::Max(MinTexelsPerCell, TargetTexelsPerSide / FMath::Max(CellsX, CellsY));
+	const int32 SizeX = CellsX * TexelsPerCell;
+	const int32 SizeY = CellsY * TexelsPerCell;
+
+	if (CellColors.Num() != CellsX * CellsY || HasCell.Num() != CellsX * CellsY || CellLabels.Num() != CellsX * CellsY)
+	{
+		return nullptr;
+	}
+
+	FImage Image(SizeX, SizeY, 1, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
 	FColor* Data = reinterpret_cast<FColor*>(Image.RawData.GetData());
 
 	// Start everything transparent.
-	for (int32 i = 0; i < Size * Size; ++i)
+	for (int32 i = 0; i < SizeX * SizeY; ++i)
 	{
 		Data[i] = FColor(0, 0, 0, 0);
 	}
@@ -448,39 +535,34 @@ UTexture2D* FBeanAssets::CreateOverlayTexture(const TArray<FLinearColor>& CellCo
 	constexpr uint8 DarkAlpha = 255;  // 1.0
 	constexpr float DarkLuminanceMax = 0.35f;
 	const FColor Line(35, 35, 35, LightAlpha);
-	const int32 CellStart = (CellsPerSide - N) / 2;
 
-	for (int32 Ty = 0; Ty < Size; ++Ty)
+	for (int32 Ty = 0; Ty < SizeY; ++Ty)
 	{
 		const int32 GY = Ty / TexelsPerCell;
 		const int32 iy = Ty % TexelsPerCell;
-		if (GY < CellStart || GY >= CellStart + N) continue;
-		const int32 By = GY - CellStart;
 
-		for (int32 Tx = 0; Tx < Size; ++Tx)
+		for (int32 Tx = 0; Tx < SizeX; ++Tx)
 		{
 			const int32 GX = Tx / TexelsPerCell;
 			const int32 ix = Tx % TexelsPerCell;
-			if (GX < CellStart || GX >= CellStart + N) continue;
-			const int32 Bx = GX - CellStart;
 
-			// Grid: each block's top/left edge plus the region's outer right/bottom frame.
+			// Grid: each block's top/left edge plus the canvas' outer right/bottom frame.
 			const bool bGrid = (ix == 0 || iy == 0)
-				|| (GX == CellStart + N - 1 && ix == TexelsPerCell - 1)
-				|| (GY == CellStart + N - 1 && iy == TexelsPerCell - 1);
+				|| (GX == CellsX - 1 && ix == TexelsPerCell - 1)
+				|| (GY == CellsY - 1 && iy == TexelsPerCell - 1);
 			if (bGrid)
 			{
-				Data[Ty * Size + Tx] = Line;
+				Data[Ty * SizeX + Tx] = Line;
 				continue;
 			}
 
-			const int32 Src = By * N + Bx;
-			if (Src < HasCell.Num() && HasCell[Src] && Src < CellColors.Num())
+			const int32 Src = GY * CellsX + GX;
+			if (HasCell[Src])
 			{
 				FColor C = CellColors[Src].ToFColor(true);
 				const float Lum = (0.2126f * C.R + 0.7152f * C.G + 0.0722f * C.B) / 255.0f;
 				C.A = (Lum <= DarkLuminanceMax) ? DarkAlpha : LightAlpha;
-				Data[Ty * Size + Tx] = C;
+				Data[Ty * SizeX + Tx] = C;
 			}
 		}
 	}
@@ -505,22 +587,22 @@ UTexture2D* FBeanAssets::CreateOverlayTexture(const TArray<FLinearColor>& CellCo
 	constexpr int32 FontW = 3;
 	constexpr int32 FontH = 5;
 	constexpr int32 FontPitch = 4; // 3 + 1 gap
-	constexpr int32 TextRight = TexelsPerCell - 3;  // local column of the last digit's right edge
-	constexpr int32 TextBottom = TexelsPerCell - 3; // local row of the last font row
+	// TexelsPerCell comes from a ternary (not FMath::Max) so these stay constant-foldable.
+	const int32 TextRight = TexelsPerCell - 3;  // local column of the last digit's right edge
+	const int32 TextBottom = TexelsPerCell - 3; // local row of the last font row
 
-	for (int32 By = 0; By < N; ++By)
+	for (int32 By = 0; By < CellsY; ++By)
 	{
-		const int32 Oy = (CellStart + By) * TexelsPerCell;
-		for (int32 Bx = 0; Bx < N; ++Bx)
+		const int32 Oy = By * TexelsPerCell;
+		for (int32 Bx = 0; Bx < CellsX; ++Bx)
 		{
-			const int32 Src = By * N + Bx;
-			if (Src >= CellLabels.Num() || Src >= HasCell.Num() || !HasCell[Src]) continue;
+			const int32 Src = By * CellsX + Bx;
+			if (!HasCell[Src]) continue;
 			const int32 Label = CellLabels[Src];
 			if (Label < 1 || Label > PaletteColors.Num()) continue;
 
 			// Opposite-shade digits: near-black over light blocks, near-white over dark ones.
 			FColor Core(245, 245, 245, 250);
-			if (Src < CellColors.Num())
 			{
 				const FColor Fill = CellColors[Src].ToFColor(true);
 				const float FillLum = (0.2126f * Fill.R + 0.7152f * Fill.G + 0.0722f * Fill.B) / 255.0f;
@@ -535,7 +617,7 @@ UTexture2D* FBeanAssets::CreateOverlayTexture(const TArray<FLinearColor>& CellCo
 			}
 			Buffer[NumDigits++] = static_cast<char>('0' + (Label % 10));
 
-			const int32 Ox = (CellStart + Bx) * TexelsPerCell;
+			const int32 Ox = Bx * TexelsPerCell;
 			const int32 TotalW = NumDigits * FontPitch - 1;
 			const int32 StartX = Ox + TextRight - (TotalW - 1);
 			const int32 StartY = Oy + TextBottom - (FontH - 1);
@@ -549,7 +631,7 @@ UTexture2D* FBeanAssets::CreateOverlayTexture(const TArray<FLinearColor>& CellCo
 					for (int32 Col = 0; Col < FontW; ++Col)
 					{
 						if (G[Row * FontW + Col] != '1') continue;
-						Data[(StartY + Row) * Size + (GlyphX + Col)] = Core;
+						Data[(StartY + Row) * SizeX + (GlyphX + Col)] = Core;
 					}
 				}
 			}
@@ -563,6 +645,82 @@ UTexture2D* FBeanAssets::CreateOverlayTexture(const TArray<FLinearColor>& CellCo
 		Texture->SRGB = true;
 		Texture->AddressX = TA_Clamp;
 		Texture->AddressY = TA_Clamp;
+		Texture->UpdateResource();
+	}
+	return Texture;
+}
+
+bool FBeanAssets::CreateCellsImage(const TArray<uint8>& Cells, int32 Width, int32 Height, uint8 EmptyValue,
+	const TArray<FLinearColor>& PaletteColors, int32 MinX, int32 MinY, int32 MaxX, int32 MaxY,
+	int32 PixelsPerCell, FImage& OutImage)
+{
+	const int32 CellsW = MaxX - MinX + 1;
+	const int32 CellsH = MaxY - MinY + 1;
+	const int32 Scale = FMath::Max(1, PixelsPerCell);
+	const int32 ColorCount = PaletteColors.Num();
+	if (CellsW <= 0 || CellsH <= 0 || ColorCount <= 0 || Width <= 0 || Height <= 0 || Cells.Num() < Width * Height)
+	{
+		return false;
+	}
+
+	const int32 SizeX = CellsW * Scale;
+	const int32 SizeY = CellsH * Scale;
+	OutImage.Init(SizeX, SizeY, 1, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
+	FColor* Data = reinterpret_cast<FColor*>(OutImage.RawData.GetData());
+
+	// The pegboard the beads sit on: the same warm off-white as the ground, so an exported
+	// picture reads like the board the beads were placed on.
+	const FColor Board(235, 232, 222);
+	for (int32 i = 0; i < SizeX * SizeY; ++i)
+	{
+		Data[i] = Board;
+	}
+
+	// A proportional gap keeps neighbouring beads apart. It stays 0 below 8 px per bead, where
+	// a gap would eat more of the bead than it shows.
+	const int32 Gap = Scale / 8;
+	for (int32 By = 0; By < CellsH; ++By)
+	{
+		for (int32 Bx = 0; Bx < CellsW; ++Bx)
+		{
+			const uint8 ColorIndex = Cells[(MinY + By) * Width + (MinX + Bx)];
+			if (ColorIndex == EmptyValue || ColorIndex >= ColorCount)
+			{
+				continue;
+			}
+
+			const FColor Bead = PaletteColors[ColorIndex].ToFColor(true);
+			const int32 X0 = Bx * Scale + Gap;
+			const int32 Y0 = By * Scale + Gap;
+			const int32 X1 = (Bx + 1) * Scale - Gap;
+			const int32 Y1 = (By + 1) * Scale - Gap;
+			for (int32 Y = Y0; Y < Y1; ++Y)
+			{
+				FColor* Row = Data + Y * SizeX;
+				for (int32 X = X0; X < X1; ++X)
+				{
+					Row[X] = Bead;
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
+UTexture2D* FBeanAssets::CreateImageTexture(const FImage& Image)
+{
+	if (Image.SizeX <= 0 || Image.SizeY <= 0 || Image.RawData.Num() <= 0)
+	{
+		return nullptr;
+	}
+
+	UTexture2D* Texture = FImageUtils::CreateTexture2DFromImage(FImageView(Image));
+	if (Texture)
+	{
+		// Hard pixel edges, so the on-screen preview looks like the file that will be written.
+		Texture->Filter = TF_Nearest;
+		Texture->SRGB = true;
 		Texture->UpdateResource();
 	}
 	return Texture;

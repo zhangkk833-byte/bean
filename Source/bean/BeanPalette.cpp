@@ -1,5 +1,6 @@
 #include "BeanPalette.h"
 
+#include "Async/ParallelFor.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "HAL/FileManager.h"
@@ -259,8 +260,8 @@ namespace
 
 	/**
 	 * Block-level refinement: cluster the block's sampled Lab colors into K=2 groups, take the
-	 * larger-weight cluster, then pick its (weighted) mode — the palette color the members are
-	 * actually closest to — rather than snapping a synthetic centroid. This avoids inventing a
+	 * larger-weight cluster, then pick its (weighted) mode 鈥?the palette color the members are
+	 * actually closest to 鈥?rather than snapping a synthetic centroid. This avoids inventing a
 	 * blended "grey in-between" colour at green/brown edges (Q2), and combined with the neutral
 	 * suppression above keeps the block on one of its two real colors.
 	 */
@@ -445,6 +446,257 @@ int32 FBeanPalette::NearestColorIndexLab(const TArray<FVector3f>& LabPalette, co
 	return NearestLabPaletteIndex(LabPalette, LabFromSRGB(SrgbColor.R / 255.0f, SrgbColor.G / 255.0f, SrgbColor.B / 255.0f));
 }
 
+// ===========================================================================================
+// Block quantizer core, shared by QuantizeImage (square canvas) and QuantizeFeature (any
+// canvas shape). Keeping ONE implementation means the improved image conversion and the legacy
+// path can never drift apart.
+// ===========================================================================================
+namespace
+{
+	/** Per-step knobs. Tune these to A/B which combination fits your art. */
+	struct FBeanBlockQuantizeTuning
+	{
+		bool  bUseKMeans = true;          // K-Means (K=2) largest cluster instead of a plain vote.
+		bool  bSuppressNeutral = true;    // kill the grey "in-between" band at coloured edges.
+		bool  bDespeckle = true;          // replace isolated muddy blocks inside coloured regions.
+		bool  bGaussianWeight = true;     // weight samples toward the block centre.
+		bool  bSaturationWeight = false;  // down-weight desaturated transition pixels (off).
+		float SaturationLowStrength = 0.7f;
+		float GaussianSigma = 0.35f;
+		float SharpeningAmount = 0.5f;    // local unsharp so AA edge pixels pick a side.
+		int32 SharpeningRadius = 2;
+		bool  bOpaqueWeight = true;
+		uint8 OpaqueSolidAlpha = 200;
+		float OpaqueLowWeight = 0.12f;
+		float OpaqueMidWeight = 0.35f;
+		bool  bRequireSolid = true;       // a block must contain a solid pixel to be placed.
+		/**
+		 * Fraction of a block's sampled pixels that may be transparent before the block is
+		 * dropped as a hole.
+		 *
+		 * bRequireSolid alone only rejects blocks with NO solid pixel, so a thin transparent rim
+		 * (a logo's soft border, a sticker outline) still produced a full ring of beads: half of
+		 * each rim block was empty and the other half was solid, and the solid side won the colour
+		 * vote. Treating a mostly-empty block as a hole keeps the silhouette faithful instead of
+		 * growing a bead-wide outline around it. Kept at 0.5 so a block that is at least half
+		 * solid still gets its bead (detail is not eroded away).
+		 */
+		float TransparentFractionLimit = 0.5f;
+		int32 MinKMeansSamples = 4;
+		int32 KMeansIters = 8;
+		int64 MaxSamplesPerBlock = 64;    // ~8x8 samples per block keeps huge images fast.
+	};
+
+	/** Quantize one source rectangle [Xs,Xe) x [Ys,Ye) into a single palette index.
+	 *  Mirrors the original per-block code exactly: sharpen -> Lab -> weight -> K-Means/weighted
+	 *  mode -> neutral suppression. Returns OutEmptyValue when the block holds no usable pixel. */
+	uint8 QuantizeCellRegion(const TArray<FVector3f>& LabPalette, const TArray<float>& PaletteChroma,
+		const FColor* Pixels, int32 Width, int32 Height, int64 Xs, int64 Ys, int64 Xe, int64 Ye,
+		uint8 EmptyValue, const FBeanBlockQuantizeTuning& Knobs,
+		TArray<FVector3f>& ScratchLabs, TArray<float>& ScratchWeights,
+		TArray<FVector3f>& ScratchSubLabs, TArray<float>& ScratchSubWeights, TArray<float>& ScratchWins)
+	{
+		const int64 Aw = Xe - Xs;
+		const int64 Ah = Ye - Ys;
+		if (Aw <= 0 || Ah <= 0) return EmptyValue;
+
+		const double CX = (Xs + Xe - 1) * 0.5;
+		const double CY = (Ys + Ye - 1) * 0.5;
+		const double HalfX = FMath::Max(1.0, Aw * 0.5);
+		const double HalfY = FMath::Max(1.0, Ah * 0.5);
+
+		ScratchLabs.Reset();
+		ScratchWeights.Reset();
+		bool bAnySolid = false;
+		int32 TransparentSamples = 0;
+		int32 ExaminedSamples = 0;
+
+		// Sample one source pixel: sharpen, convert to Lab, compute its weight.
+		auto SamplePixel = [&](int64 X, int64 Y)
+		{
+			const FColor& Px = Pixels[Y * (int64)Width + X];
+			++ExaminedSamples;
+			if (Px.A < 128)
+			{
+				++TransparentSamples;
+				return; // transparent: ignored
+			}
+
+			float R = Px.R, G = Px.G, B = Px.B;
+
+			if (Knobs.SharpeningAmount > 0.0f)
+			{
+				// Local mean of a small neighbourhood, then unsharp: p' = p + k*(p - mean).
+				// Transition pixels land closer to one side, so fewer of them are ambiguous.
+				int64 SR = 0, SG = 0, SB = 0;
+				int32 Nn = 0;
+				for (int32 dy = -Knobs.SharpeningRadius; dy <= Knobs.SharpeningRadius; ++dy)
+				{
+					const int64 yy = FMath::Clamp<int64>(Y + dy, 0, Height - 1);
+					const FColor* Row = Pixels + yy * (int64)Width;
+					for (int32 dx = -Knobs.SharpeningRadius; dx <= Knobs.SharpeningRadius; ++dx)
+					{
+						const int64 xx = FMath::Clamp<int64>(X + dx, 0, Width - 1);
+						const FColor& Np = Row[xx];
+						if (Np.A < 128) continue;
+						SR += Np.R; SG += Np.G; SB += Np.B; ++Nn;
+					}
+				}
+				if (Nn > 0)
+				{
+					const float Inv = 1.0f / Nn;
+					R = FMath::Clamp(R + Knobs.SharpeningAmount * (R - SR * Inv), 0.0f, 255.0f);
+					G = FMath::Clamp(G + Knobs.SharpeningAmount * (G - SG * Inv), 0.0f, 255.0f);
+					B = FMath::Clamp(B + Knobs.SharpeningAmount * (B - SB * Inv), 0.0f, 255.0f);
+				}
+			}
+
+			// Step 3: still match in CIE Lab so colour fidelity stays high.
+			const FVector3f Lab = LabFromSRGB(R / 255.0f, G / 255.0f, B / 255.0f);
+
+			float W = 1.0f;
+			if (Knobs.bGaussianWeight)
+			{
+				const float FX = (float)((X - CX) / HalfX);   // ~[-1,1]
+				const float FY = (float)((Y - CY) / HalfY);
+				W = (float)FMath::Exp(-(FX * FX + FY * FY) / (2.0f * Knobs.GaussianSigma * Knobs.GaussianSigma));
+			}
+			if (Knobs.bSaturationWeight)
+			{
+				const float Chroma = FMath::Sqrt(Lab.Y * Lab.Y + Lab.Z * Lab.Z);
+				const float Sat = FMath::Clamp(Chroma / 128.0f, 0.0f, 1.0f);
+				W *= (1.0f - Knobs.SaturationLowStrength * (1.0f - Sat));
+			}
+			if (Knobs.bOpaqueWeight)
+			{
+				if (Px.A >= Knobs.OpaqueSolidAlpha)
+				{
+					bAnySolid = true;
+				}
+				else
+				{
+					// Fuzzy anti-aliased rim: barely contributes, so the solid colour wins.
+					W *= (Px.A >= 160) ? Knobs.OpaqueMidWeight : Knobs.OpaqueLowWeight;
+				}
+			}
+
+			ScratchLabs.Add(Lab);
+			ScratchWeights.Add(W);
+		};
+
+		if (Aw * Ah <= Knobs.MaxSamplesPerBlock)
+		{
+			// Small block: sample every source pixel inside it.
+			for (int64 Y = Ys; Y < Ye; ++Y)
+				for (int64 X = Xs; X < Xe; ++X)
+					SamplePixel(X, Y);
+		}
+		else
+		{
+			// Large block: stratified subsample preserving the block's aspect ratio.
+			const int32 Cols = FMath::Clamp<int32>(
+				(int32)FMath::CeilToDouble(FMath::Sqrt(Knobs.MaxSamplesPerBlock * (double)Aw / (double)Ah)), 1, (int32)Aw);
+			const int32 Rows = FMath::Clamp<int32>(
+				(int32)FMath::CeilToDouble(FMath::Sqrt(Knobs.MaxSamplesPerBlock * (double)Ah / (double)Aw)), 1, (int32)Ah);
+			for (int32 R = 0; R < Rows; ++R)
+			{
+				const int64 Y = Ys + (int64)(((double)R + 0.5) * Ah / Rows);
+				for (int32 C = 0; C < Cols; ++C)
+				{
+					const int64 X = Xs + (int64)(((double)C + 0.5) * Aw / Cols);
+					SamplePixel(X, Y);
+				}
+			}
+		}
+
+		const int32 SampleCount = ScratchLabs.Num();
+		if (SampleCount == 0) return EmptyValue;
+
+		// Primarily-transparent block: hole, so a thin transparent rim does not turn into a ring
+		// of beads around the subject. Checked against every examined pixel (not just the solid
+		// ones) so it is a true coverage fraction.
+		if (ExaminedSamples > 0
+			&& (float)TransparentSamples > Knobs.TransparentFractionLimit * (float)ExaminedSamples)
+		{
+			return EmptyValue;
+		}
+
+		if (Knobs.bRequireSolid && !bAnySolid)
+		{
+			// Only fuzzy anti-aliased rim here (no solid pixel): drop it so a dirty ring
+			// of blocks does not appear around the sticker's transparent silhouette.
+			return EmptyValue;
+		}
+
+		if (Knobs.bUseKMeans && SampleCount >= Knobs.MinKMeansSamples)
+		{
+			// Step 2: largest K=2 cluster, then its weighted real-color mode (not a centroid).
+			return static_cast<uint8>(KMeansLargestPaletteIndex(
+				LabPalette, PaletteChroma, ScratchLabs, ScratchWeights, Knobs.KMeansIters,
+				Knobs.bSuppressNeutral, ScratchSubLabs, ScratchSubWeights, ScratchWins));
+		}
+
+		// Fallback / base: weighted mode of each sample's nearest palette colour.
+		return static_cast<uint8>(WeightedModePaletteIndex(
+			LabPalette, PaletteChroma, ScratchLabs, ScratchWeights, Knobs.bSuppressNeutral, ScratchWins));
+	}
+
+	/** Despeckle pass over a W x H cell buffer: an isolated neutral cell entirely surrounded by
+	 *  colourful neighbours is usually a leftover grey transition band -> take the dominant
+	 *  neighbour colour. Identical to the original square-grid pass, generalised to W != H. */
+	void DespeckleCells(const TArray<float>& PaletteChroma, uint8 EmptyValue, int32 W, int32 H, TArray<uint8>& Cells)
+	{
+		if (W <= 2 || H <= 2 || Cells.Num() < W * H) return;
+		const int32 NumPalette = PaletteChroma.Num();
+		const TArray<uint8> Original = Cells;
+
+		for (int32 Y = 0; Y < H; ++Y)
+		{
+			for (int32 X = 0; X < W; ++X)
+			{
+				const int32 Idx = Y * W + X;
+				const uint8 Cell = Original[Idx];
+				if (Cell == EmptyValue || Cell >= NumPalette) continue;
+				if (PaletteChroma[Cell] >= NeutralChroma) continue; // not neutral
+
+				int32 ColourCounts[256] = {}; // palette index (<= 48) -> neighbour count
+				int32 ColourfulNeighbours = 0;
+				for (int32 dy = -1; dy <= 1; ++dy)
+				{
+					const int32 Ny = Y + dy;
+					if (Ny < 0 || Ny >= H) continue;
+					for (int32 dx = -1; dx <= 1; ++dx)
+					{
+						if (dx == 0 && dy == 0) continue;
+						const int32 Nx = X + dx;
+						if (Nx < 0 || Nx >= W) continue;
+						const uint8 Nc = Original[Ny * W + Nx];
+						if (Nc == EmptyValue || Nc >= NumPalette) continue;
+						++ColourCounts[Nc];
+						if (PaletteChroma[Nc] >= NeutralChroma) ++ColourfulNeighbours;
+					}
+				}
+				if (ColourfulNeighbours >= 5) // surrounded by colour -> likely a transition halo
+				{
+					int32 Best = -1, Worst = 0;
+					for (int32 c = 0; c < NumPalette; ++c)
+					{
+						if (ColourCounts[c] > 0 && PaletteChroma[c] >= NeutralChroma && ColourCounts[c] > Worst)
+						{
+							Worst = ColourCounts[c];
+							Best = c;
+						}
+					}
+					if (Best >= 0)
+					{
+						Cells[Idx] = static_cast<uint8>(Best);
+					}
+				}
+			}
+		}
+	}
+}
+
 void FBeanPalette::QuantizeImage(const TArray<FVector3f>& LabPalette, const FColor* Pixels,
 	int32 Width, int32 Height, int32 Granularity, uint8 EmptyValue, TArray<uint8>& OutCells)
 {
@@ -459,39 +711,7 @@ void FBeanPalette::QuantizeImage(const TArray<FVector3f>& LabPalette, const FCol
 
 	OutCells.SetNum(Count);
 	const int32 NumPalette = LabPalette.Num();
-
-	// ---- Per-step knobs. Tune these to A/B which combination fits your art ---------
-	// Step 2: K-Means (K=2) largest-cluster instead of a plain vote. Most robust; cheap.
-	constexpr bool   bUseKMeans         = true;
-	// Anti-alias fix: if a block has strongly saturated content but the vote lands on a grey,
-	// the grey is a transition "in-between" band -> prefer the strongest real colour. This is
-	// what removes the grey outline at green/brown edges, without harming genuinely grey blocks.
-	constexpr bool   bSuppressNeutral   = true;
-	// Optional post-pass: replace isolated muddy/grey blocks that sit inside a colourful region.
-	constexpr bool   bDespeckle         = true;
-	// Step 4 (spatial): weight samples toward the block centre (reduces neighbour bleed).
-	constexpr bool   bGaussianWeight    = true;
-	// Step 4 (optional): down-weight desaturated (transition) pixels. NOTE: suppression above
-	// already handles the grey-edge case; keep this off so neutral greys are not biased against.
-	constexpr bool   bSaturationWeight  = false;
-	constexpr float  SaturationLowStrength = 0.7f;
-	constexpr float  GaussianSigma      = 0.35f;   // [0,1] in block-half-normalised units
-	// Step 1: local edge sharpening (unsharp) so anti-aliased edge pixels get pushed to one
-	// side instead of staying "in between". 0 disables (avoids overshoot/halo risk).
-	constexpr float  SharpeningAmount   = 0.5f;
-	constexpr int32  SharpeningRadius   = 2;
-	// Step 5 (transparency): for stickers with a soft/anti-aliased alpha edge, the fuzzy
-	// semi-transparent rim is what leaves a dirty ring of blocks. Down-weight those pixels so
-	// the solid Colour wins, and require every block to actually contain a solid pixel.
-	constexpr bool   bOpaqueWeight      = true;
-	constexpr uint8  OpaqueSolidAlpha   = 200;   // pixels at/above this alpha count as "solid"
-	constexpr float  OpaqueLowWeight    = 0.12f; // mostly transparent AA pixels
-	constexpr float  OpaqueMidWeight    = 0.35f; // moderately transparent AA pixels
-	constexpr bool   bRequireSolid      = true;  // a block must contain a solid pixel to be placed
-	constexpr int32  MinKMeansSamples   = 4;
-	constexpr int32  KMeansIters        = 8;
-	// Cap the stratified subsampling so huge images stay fast; ~8x8 per block.
-	constexpr int64  MaxSamplesPerBlock = 64;
+	const FBeanBlockQuantizeTuning Knobs;
 
 	// Per-palette-chroma lookup (used by the neutral suppression).
 	TArray<float> PaletteChroma;
@@ -516,201 +736,334 @@ void FBeanPalette::QuantizeImage(const TArray<FVector3f>& LabPalette, const FCol
 		// so a source smaller than the grid still yields a color for every block).
 		const int64 Ys = FMath::Clamp<int64>((int64)FMath::FloorToDouble((double)By * Height / N), 0, Height);
 		const int64 Ye = FMath::Clamp<int64>((int64)FMath::CeilToDouble((double)(By + 1) * Height / N), 0, Height);
-		const int64 Ah = Ye - Ys;
-		if (Ah <= 0) continue;
-		const double CY = (Ys + Ye - 1) * 0.5;
-		const double HalfY = FMath::Max(1.0, Ah * 0.5);
 
 		for (int32 Bx = 0; Bx < N; ++Bx)
 		{
 			const int64 Xs = FMath::Clamp<int64>((int64)FMath::FloorToDouble((double)Bx * Width / N), 0, Width);
 			const int64 Xe = FMath::Clamp<int64>((int64)FMath::CeilToDouble((double)(Bx + 1) * Width / N), 0, Width);
-			const int64 Aw = Xe - Xs;
 
-			Labs.Reset();
-			Weights.Reset();
-
-			if (Aw <= 0)
-			{
-				OutCells[By * N + Bx] = EmptyValue;
-				continue;
-			}
-			const double CX = (Xs + Xe - 1) * 0.5;
-			const double HalfX = FMath::Max(1.0, Aw * 0.5);
-			bool bAnySolid = false;
-
-			// Sample one source pixel: sharpen, convert to Lab, compute its weight.
-			auto SamplePixel = [&](int64 X, int64 Y)
-			{
-				const FColor& Px = Pixels[Y * (int64)Width + X];
-				if (Px.A < 128) return; // transparent: ignored
-
-				float R = Px.R, G = Px.G, B = Px.B;
-
-				if (SharpeningAmount > 0.0f)
-				{
-					// Local mean of a small neighbourhood, then unsharp: p' = p + k*(p - mean).
-					// Transition pixels land closer to one side, so fewer of them are ambiguous.
-					int64 SR = 0, SG = 0, SB = 0;
-					int32 Nn = 0;
-					for (int32 dy = -SharpeningRadius; dy <= SharpeningRadius; ++dy)
-					{
-						const int64 yy = FMath::Clamp<int64>(Y + dy, 0, Height - 1);
-						const FColor* Row = Pixels + yy * (int64)Width;
-						for (int32 dx = -SharpeningRadius; dx <= SharpeningRadius; ++dx)
-						{
-							const int64 xx = FMath::Clamp<int64>(X + dx, 0, Width - 1);
-							const FColor& Np = Row[xx];
-							if (Np.A < 128) continue;
-							SR += Np.R; SG += Np.G; SB += Np.B; ++Nn;
-						}
-					}
-					if (Nn > 0)
-					{
-						const float Inv = 1.0f / Nn;
-						R = FMath::Clamp(R + SharpeningAmount * (R - SR * Inv), 0.0f, 255.0f);
-						G = FMath::Clamp(G + SharpeningAmount * (G - SG * Inv), 0.0f, 255.0f);
-						B = FMath::Clamp(B + SharpeningAmount * (B - SB * Inv), 0.0f, 255.0f);
-					}
-				}
-
-				// Step 3: still match in CIE Lab so colour fidelity stays high.
-				const FVector3f Lab = LabFromSRGB(R / 255.0f, G / 255.0f, B / 255.0f);
-
-				float W = 1.0f;
-				if (bGaussianWeight)
-				{
-					const float FX = (float)((X - CX) / HalfX);   // ~[-1,1]
-					const float FY = (float)((Y - CY) / HalfY);
-					W = (float)FMath::Exp(-(FX * FX + FY * FY) / (2.0f * GaussianSigma * GaussianSigma));
-				}
-				if (bSaturationWeight)
-				{
-					const float Chroma = FMath::Sqrt(Lab.Y * Lab.Y + Lab.Z * Lab.Z);
-					const float Sat = FMath::Clamp(Chroma / 128.0f, 0.0f, 1.0f);
-					W *= (1.0f - SaturationLowStrength * (1.0f - Sat));
-				}
-				if (bOpaqueWeight)
-				{
-					if (Px.A >= OpaqueSolidAlpha)
-					{
-						bAnySolid = true;
-					}
-					else
-					{
-						// Fuzzy anti-aliased rim: barely contributes, so the solid colour wins.
-						W *= (Px.A >= 160) ? OpaqueMidWeight : OpaqueLowWeight;
-					}
-				}
-
-				Labs.Add(Lab);
-				Weights.Add(W);
-			};
-
-			if (Aw * Ah <= MaxSamplesPerBlock)
-			{
-				// Small block: sample every source pixel inside it.
-				for (int64 Y = Ys; Y < Ye; ++Y)
-					for (int64 X = Xs; X < Xe; ++X)
-						SamplePixel(X, Y);
-			}
-			else
-			{
-				// Large block: stratified subsample preserving the block's aspect ratio.
-				const int32 Cols = FMath::Clamp<int32>(
-					(int32)FMath::CeilToDouble(FMath::Sqrt(MaxSamplesPerBlock * (double)Aw / (double)Ah)), 1, (int32)Aw);
-				const int32 Rows = FMath::Clamp<int32>(
-					(int32)FMath::CeilToDouble(FMath::Sqrt(MaxSamplesPerBlock * (double)Ah / (double)Aw)), 1, (int32)Ah);
-				for (int32 R = 0; R < Rows; ++R)
-				{
-					const int64 Y = Ys + (int64)(((double)R + 0.5) * Ah / Rows);
-					for (int32 C = 0; C < Cols; ++C)
-					{
-						const int64 X = Xs + (int64)(((double)C + 0.5) * Aw / Cols);
-						SamplePixel(X, Y);
-					}
-				}
-			}
-
-			const int32 SampleCount = Labs.Num();
-			if (SampleCount == 0)
-			{
-				OutCells[By * N + Bx] = EmptyValue;
-				continue;
-			}
-			if (bRequireSolid && !bAnySolid)
-			{
-				// Only fuzzy anti-aliased rim here (no solid pixel): drop it so a dirty ring
-				// of blocks does not appear around the sticker's transparent silhouette.
-				OutCells[By * N + Bx] = EmptyValue;
-				continue;
-			}
-
-			if (bUseKMeans && SampleCount >= MinKMeansSamples)
-			{
-				// Step 2: largest K=2 cluster, then its weighted real-color mode (not a centroid).
-				OutCells[By * N + Bx] = static_cast<uint8>(KMeansLargestPaletteIndex(
-					LabPalette, PaletteChroma, Labs, Weights, KMeansIters,
-					bSuppressNeutral, SubLabs, SubWeights, Wins));
-			}
-			else
-			{
-				// Fallback / base: weighted mode of each sample's nearest palette colour.
-				OutCells[By * N + Bx] = static_cast<uint8>(WeightedModePaletteIndex(
-					LabPalette, PaletteChroma, Labs, Weights, bSuppressNeutral, Wins));
-			}
+			OutCells[By * N + Bx] = QuantizeCellRegion(LabPalette, PaletteChroma, Pixels, Width, Height,
+				Xs, Ys, Xe, Ye, EmptyValue, Knobs, Labs, Weights, SubLabs, SubWeights, Wins);
 		}
 	}
+	// (QuantizeImage keeps its own serial loop: it is only used by the square-canvas tests.)
 
 	// Optional despeckle: an isolated neutral block entirely surrounded by colourful neighbours
 	// is usually a leftover grey transition band -- replace it with the dominant neighbour colour.
-	if (bDespeckle && N > 2)
+	if (Knobs.bDespeckle)
 	{
-		TArray<uint8> Original = OutCells;
-		for (int32 Y = 0; Y < N; ++Y)
-		{
-			for (int32 X = 0; X < N; ++X)
-			{
-				const int32 Idx = Y * N + X;
-				const uint8 Cell = Original[Idx];
-				if (Cell == EmptyValue || PaletteChroma[Cell] >= NeutralChroma) continue; // not neutral
+		DespeckleCells(PaletteChroma, EmptyValue, N, N, OutCells);
+	}
+}
 
-				int32 ColourCounts[256] = {}; // palette index (<= 48) -> neighbour count
-				int32 ColourfulNeighbours = 0;
-				for (int32 dy = -1; dy <= 1; ++dy)
-				{
-					const int32 Ny = Y + dy;
-					if (Ny < 0 || Ny >= N) continue;
-					for (int32 dx = -1; dx <= 1; ++dx)
-					{
-						if (dx == 0 && dy == 0) continue;
-						const int32 Nx = X + dx;
-						if (Nx < 0 || Nx >= N) continue;
-						const uint8 Nc = Original[Ny * N + Nx];
-						if (Nc == EmptyValue) continue;
-						++ColourCounts[Nc];
-						if (PaletteChroma[Nc] >= NeutralChroma) ++ColourfulNeighbours;
-					}
-				}
-				if (ColourfulNeighbours >= 5) // surrounded by colour -> likely a transition halo
-				{
-					int32 Best = -1, Worst = 0;
-					for (int32 c = 0; c < NumPalette; ++c)
-					{
-						if (ColourCounts[c] > 0 && PaletteChroma[c] >= NeutralChroma && ColourCounts[c] > Worst)
-						{
-							Worst = ColourCounts[c];
-							Best = c;
-						}
-					}
-					if (Best >= 0)
-					{
-						OutCells[Idx] = static_cast<uint8>(Best);
-					}
-				}
+void FBeanPalette::QuantizeFeature(const TArray<FVector3f>& LabPalette, const FColor* Pixels,
+	int32 Width, int32 Height, int32 OutWidth, int32 OutHeight, uint8 EmptyValue, TArray<uint8>& Cells,
+	bool bPostProcessOnly)
+{
+	// Any canvas shape, same pipeline as QuantizeImage. Used by FBeanImageConverter so that
+	// landscape / portrait canvases quantize exactly like the square one always did.
+	const int32 W = OutWidth;
+	const int32 H = OutHeight;
+	const int32 Count = W * H;
+
+	if (W <= 0 || H <= 0 || !Pixels || Width <= 0 || Height <= 0 || LabPalette.Num() == 0)
+	{
+		Cells.Init(EmptyValue, FMath::Max(0, Count));
+		return;
+	}
+
+	Cells.SetNum(Count);
+	const int32 NumPalette = LabPalette.Num();
+	const FBeanBlockQuantizeTuning Knobs;
+
+	TArray<float> PaletteChroma;
+	PaletteChroma.SetNum(NumPalette);
+	for (int32 i = 0; i < NumPalette; ++i)
+	{
+		PaletteChroma[i] = LabChroma(LabPalette[i]);
+	}
+
+	if (!bPostProcessOnly)
+	{
+		// Cells are independent, so the block loop is split by output row across worker threads;
+		// each row keeps its own scratch buffers (they cannot be shared). A 128x128 canvas over a
+		// 6000x6000 photo spent ~240 ms here, nearly all of the import.
+		ParallelFor(H, [&](int32 By)
+		{
+			TArray<FVector3f> Labs, SubLabs;
+			TArray<float>     Weights, SubWeights, Wins;
+			Labs.Reserve(160);
+			SubLabs.Reserve(160);
+			Weights.Reserve(160);
+			SubWeights.Reserve(160);
+			Wins.SetNum(NumPalette);
+
+			const int64 Ys = FMath::Clamp<int64>((int64)FMath::FloorToDouble((double)By * Height / H), 0, Height);
+			const int64 Ye = FMath::Clamp<int64>((int64)FMath::CeilToDouble((double)(By + 1) * Height / H), 0, Height);
+
+			for (int32 Bx = 0; Bx < W; ++Bx)
+			{
+				const int64 Xs = FMath::Clamp<int64>((int64)FMath::FloorToDouble((double)Bx * Width / W), 0, Width);
+				const int64 Xe = FMath::Clamp<int64>((int64)FMath::CeilToDouble((double)(Bx + 1) * Width / W), 0, Width);
+
+				Cells[By * W + Bx] = QuantizeCellRegion(LabPalette, PaletteChroma, Pixels, Width, Height,
+					Xs, Ys, Xe, Ye, EmptyValue, Knobs, Labs, Weights, SubLabs, SubWeights, Wins);
+			}
+		});
+	}
+
+	if (Knobs.bDespeckle)
+	{
+		DespeckleCells(PaletteChroma, EmptyValue, W, H, Cells);
+	}
+}
+
+
+void FBeanPalette::SelectPaletteSubset(const TArray<FVector3f>& LabPalette, const FColor* Pixels,
+	int32 Width, int32 Height, int32 MaxColors, FBeanPaletteSubset& OutSubset)
+{
+	OutSubset.SubLab.Reset();
+	OutSubset.Remap.Reset();
+
+	const int32 NumPalette = LabPalette.Num();
+	if (NumPalette == 0)
+	{
+		return;
+	}
+
+	// Whole palette requested (or the array already is the whole palette): identity subset, so
+	// callers never need a special case and quantizer indices stay valid as-is.
+	const bool bIdentity = MaxColors <= 0 || MaxColors >= NumPalette;
+	if (bIdentity || !Pixels || Width <= 0 || Height <= 0)
+	{
+		OutSubset.SubLab = LabPalette;
+		OutSubset.Remap.SetNum(NumPalette);
+		for (int32 i = 0; i < NumPalette; ++i)
+		{
+			OutSubset.Remap[i] = static_cast<uint8>(i);
+		}
+		return;
+	}
+
+	// Sample budget. A 1M-pixel sample is plenty to pick colours, and keeps the cost independent
+	// of how large the imported image is (an 8192x8192 photo must not stall the import).
+	constexpr int64 MaxSamples = 1 << 20;
+	const int64 Total = (int64)Width * Height;
+	const int32 Stride = (int32)FMath::Max<int64>(1, Total / MaxSamples);
+
+	struct FSample
+	{
+		FVector3f Lab;
+		int32 Nearest = -1;
+	};
+	TArray<FSample> Samples;
+	Samples.Reserve((int32)FMath::Min<int64>(Total / Stride + 1, MaxSamples + 1));
+
+	TArray<int32> Frequency;
+	Frequency.Init(0, NumPalette);
+
+	for (int64 i = 0; i < Total; i += Stride)
+	{
+		const FColor& Px = Pixels[i];
+		if (Px.A < 128) continue;
+		const FVector3f Lab = LabFromSRGB(Px.R / 255.0f, Px.G / 255.0f, Px.B / 255.0f);
+		FSample S;
+		S.Lab = Lab;
+		S.Nearest = NearestLabPaletteIndex(LabPalette, Lab);
+		++Frequency[S.Nearest];
+		Samples.Add(S);
+	}
+
+	if (Samples.Num() == 0)
+	{
+		// Nothing usable in the image: keep the full palette so the quantizer still works.
+		OutSubset.SubLab = LabPalette;
+		OutSubset.Remap.SetNum(NumPalette);
+		for (int32 i = 0; i < NumPalette; ++i)
+		{
+			OutSubset.Remap[i] = static_cast<uint8>(i);
+		}
+		return;
+	}
+
+	// Total Lab-space error left if the picture were drawn with only the already-chosen colours.
+	// -1 marks a sample that is NOT yet represented; it only becomes represented on the pass where
+	// its own nearest colour is taken, so it is counted exactly once.
+	TArray<double> Residual;
+	Residual.Init(-1.0, Samples.Num());
+
+	const int32 Want = FMath::Clamp(MaxColors, 1, NumPalette);
+	OutSubset.SubLab.Reserve(Want);
+	OutSubset.Remap.Reserve(Want);
+
+	for (int32 Step = 0; Step < Want; ++Step)
+	{
+		int32 Best = -1;
+		double BestGain = -1.0;
+
+		for (int32 c = 0; c < NumPalette; ++c)
+		{
+			// The first colour is the most frequent one: the large flat regions of a picture must
+			// always survive, whatever the error metric thinks of them.
+			if (Step == 0 && Frequency[c] <= 0) continue;
+
+			double Gain = 0.0;
+			for (int32 i = 0; i < Samples.Num(); ++i)
+			{
+				if (Residual[i] < 0.0 || Samples[i].Nearest != c) continue;
+				const FVector3f& L0 = Samples[i].Lab;
+				const float d0 = L0.X - LabPalette[c].X;
+				const float d1 = L0.Y - LabPalette[c].Y;
+				const float d2 = L0.Z - LabPalette[c].Z;
+				Gain += d0 * d0 + d1 * d1 + d2 * d2;
+			}
+			if (Gain > BestGain)
+			{
+				BestGain = Gain;
+				Best = c;
 			}
 		}
+
+		if (Best < 0)
+		{
+			break; // no pixel left that a new colour could help
+		}
+
+		OutSubset.SubLab.Add(LabPalette[Best]);
+		OutSubset.Remap.Add(static_cast<uint8>(Best));
+
+		// Settle the newly represented pixels: their remaining error is held against the palette.
+		for (int32 i = 0; i < Samples.Num(); ++i)
+		{
+			if (Residual[i] < 0.0 || Samples[i].Nearest != Best) continue;
+			const FVector3f& L0 = Samples[i].Lab;
+			const float d0 = L0.X - LabPalette[Best].X;
+			const float d1 = L0.Y - LabPalette[Best].Y;
+			const float d2 = L0.Z - LabPalette[Best].Z;
+			Residual[i] = d0 * d0 + d1 * d1 + d2 * d2;
+		}
+
+		if (BestGain <= 0.0)
+		{
+			break; // exact matches only; more colours would add nothing
+		}
 	}
+}
+
+bool FBeanPalette::AutoCropRect(const FColor* Pixels, int32 Width, int32 Height, int32& OutMinX,
+	int32& OutMinY, int32& OutMaxX, int32& OutMaxY)
+{
+	OutMinX = 0;
+	OutMinY = 0;
+	OutMaxX = FMath::Max(0, Width - 1);
+	OutMaxY = FMath::Max(0, Height - 1);
+
+	if (!Pixels || Width <= 0 || Height <= 0)
+	{
+		return false;
+	}
+
+	const int64 Total = (int64)Width * Height;
+	int64 OpaqueCount = 0;
+	int32 MinX = Width, MinY = Height, MaxX = -1, MaxY = -1;
+	for (int64 i = 0; i < Total; ++i)
+	{
+		if (Pixels[i].A < 128) continue;
+		++OpaqueCount;
+		const int32 X = (int32)(i % Width);
+		const int32 Y = (int32)(i / Width);
+		MinX = FMath::Min(MinX, X);
+		MaxX = FMath::Max(MaxX, X);
+		MinY = FMath::Min(MinY, Y);
+		MaxY = FMath::Max(MaxY, Y);
+	}
+
+	// Real transparency (a PNG sticker / cut-out): the alpha channel alone already tells us where
+	// the subject is, which is the most reliable signal available.
+	if (OpaqueCount < Total)
+	{
+		if (OpaqueCount == 0)
+		{
+			return false; // nothing visible at all
+		}
+		OutMinX = MinX;
+		OutMinY = MinY;
+		OutMaxX = MaxX;
+		OutMaxY = MaxY;
+		return (MaxX - MinX + 1) < Width || (MaxY - MinY + 1) < Height;
+	}
+
+	// Fully opaque image (photo / JPEG / BMP / opaque screenshot): a subject framed by a flat
+	// backdrop. Threshold in CIE L*a*b* so a JPEG's block noise around a sharp edge, and a faint
+	// shadow, do not count as subject — a plain RGB threshold would crop far too generously.
+	const FColor Corners[4] = {
+		Pixels[0],
+		Pixels[(int64)(Width - 1)],
+		Pixels[(int64)(Height - 1) * Width],
+		Pixels[(int64)(Height - 1) * Width + (Width - 1)],
+	};
+
+	bool bCornersAgree = true;
+	for (int32 c = 1; c < 4 && bCornersAgree; ++c)
+	{
+		if (Corners[0].R != Corners[c].R || Corners[0].G != Corners[c].G || Corners[0].B != Corners[c].B)
+		{
+			bCornersAgree = false;
+		}
+	}
+
+	// No usable backdrop (the corners disagree, i.e. a photo with content right into the corners):
+	// deliberately report "cannot tell" so the caller falls back to manual cropping instead of
+	// cutting the subject off at random.
+	if (!bCornersAgree)
+	{
+		return false;
+	}
+
+	const FVector3f BgLab = LabFromSRGB(Corners[0].R / 255.0f, Corners[0].G / 255.0f, Corners[0].B / 255.0f);
+	constexpr float MinLabDeltaSq = 30.0f; // 8-bit RGB delta ~ 14, i.e. clearly "another colour"
+
+	int64 DiffCount = 0;
+	MinX = Width; MinY = Height; MaxX = -1; MaxY = -1;
+	for (int64 i = 0; i < Total; ++i)
+	{
+		const FColor& Px = Pixels[i];
+		if (Px.A < 128) continue;
+		const FVector3f Lab = LabFromSRGB(Px.R / 255.0f, Px.G / 255.0f, Px.B / 255.0f);
+		const float d0 = Lab.X - BgLab.X;
+		const float d1 = Lab.Y - BgLab.Y;
+		const float d2 = Lab.Z - BgLab.Z;
+		if ((d0 * d0 + d1 * d1 + d2 * d2) <= MinLabDeltaSq) continue;
+
+		++DiffCount;
+		const int32 X = (int32)(i % Width);
+		const int32 Y = (int32)(i / Width);
+		MinX = FMath::Min(MinX, X);
+		MaxX = FMath::Max(MaxX, X);
+		MinY = FMath::Min(MinY, Y);
+		MaxY = FMath::Max(MaxY, Y);
+	}
+
+	// Nothing distinguishable from the backdrop, or the "subject" covers the entire frame: let the
+	// dialog start from the whole picture and let the player crop by hand.
+	if (DiffCount == 0 || MaxX < 0)
+	{
+		return false;
+	}
+	if ((MaxX - MinX + 1) >= Width && (MaxY - MinY + 1) >= Height)
+	{
+		OutMinX = 0;
+		OutMinY = 0;
+		OutMaxX = Width - 1;
+		OutMaxY = Height - 1;
+		return false;
+	}
+
+	OutMinX = MinX;
+	OutMinY = MinY;
+	OutMaxX = MaxX;
+	OutMaxY = MaxY;
+	return true;
 }
 
 void FBeanPalette::DownsampleImageColors(const TArray<FVector3f>& LabPalette, const FColor* Pixels,

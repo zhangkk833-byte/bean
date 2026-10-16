@@ -15,9 +15,11 @@ struct FBeanPaletteColor
 	UPROPERTY(EditAnywhere, BlueprintReadWrite)
 	FString Name;
 
-	/** Color in linear space. */
+	/** Color in linear space. Defaulted so a default-constructed entry is never uninitialised:
+	 *  the engine reports "StructProperty FBeanPaletteColor::Color is not initialized properly"
+	 *  otherwise, and an uninitialised entry would make palette matching non-deterministic. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite)
-	FLinearColor Color;
+	FLinearColor Color = FLinearColor::White;
 };
 
 /**
@@ -63,6 +65,66 @@ public:
 	 */
 	static void QuantizeImage(const TArray<FVector3f>& LabPalette, const FColor* Pixels,
 		int32 Width, int32 Height, int32 Granularity, uint8 EmptyValue, TArray<uint8>& OutCells);
+
+	// ---------------------------------------------------------------------------------------
+	// Non-square ("feature") variant of QuantizeImage, used by the image converter.
+	//
+	// QuantizeImage works on a square Granularity x Granularity block grid, which is all the
+	// 256x256 canvas ever needed. The canvas can now be landscape or portrait (e.g. 256x192), so
+	// the block grid has to be OutWidth x OutHeight blocks instead. This entry point runs exactly
+	// the same sampling + K-Means-largest-cluster + neutral-suppression + despeckle pipeline as
+	// QuantizeImage (both call the same internal helper), so the on-screen result is identical
+	// for a square canvas.
+	//
+	// LabPalette may be a *subset* of the full palette as long as Cells inside this function map
+	// back consistently -- callers that restrict the colours must therefore pass a re-indexed
+	// subset palette and translate the returned indices afterwards (see FBeanImageConverter).
+	//
+	// bPostProcessOnly skips the block pass and only runs the despeckle polish over Cells, which
+	// is what the error-diffusion path needs (dithering must not be averaged away again).
+	// ---------------------------------------------------------------------------------------
+	static void QuantizeFeature(const TArray<FVector3f>& LabPalette, const FColor* Pixels,
+		int32 Width, int32 Height, int32 OutWidth, int32 OutHeight, uint8 EmptyValue, TArray<uint8>& Cells,
+		bool bPostProcessOnly = false);
+
+	// ---------------------------------------------------------------------------------------
+	// Palette restriction ("use at most N colours of the 48").
+	//
+	// A subset palette cannot be handed to the quantizer as-is, because the quantizer returns
+	// indices measured against the array it was given. The subset is therefore reported as a
+	// RE-INDEXED palette (SubLab / original-index table) plus Remap, which translates a quantizer
+	// result back to the caller's own palette indexing:
+	//
+	//     const uint8 GameIndex = (Cell == EmptyValue) ? EmptyValue : Remap[Cell];
+	//
+	// Selection is greedy and content driven: the most frequent nearest-palette colour is taken
+	// first (so the biggest flat regions always survive), then repeatedly the colour that removes
+	// the most remaining CIE L*a*b* error. Pixels with A < 128 are ignored. When MaxColors <= 0 or
+	// >= the palette size, the identity subset is returned so callers need no special case.
+	// ---------------------------------------------------------------------------------------
+	struct FBeanPaletteSubset
+	{
+		/** Lab coordinates of the selected colors, re-indexed 0..Num()-1 for the quantizer. */
+		TArray<FVector3f> SubLab;
+		/** Remap[subsetIndex] = index into the caller's full palette. */
+		TArray<uint8> Remap;
+		/** Number of selected colors. */
+		int32 Num() const { return SubLab.Num(); }
+	};
+
+	static void SelectPaletteSubset(const TArray<FVector3f>& LabPalette, const FColor* Pixels,
+		int32 Width, int32 Height, int32 MaxColors, FBeanPaletteSubset& OutSubset);
+
+	/**
+	 * Bounding box of the meaningful (non-transparent) content of a BGRA8 sRGB image, used by the
+	 * import dialog to suggest a crop that keeps the subject. Alpha 8-bit images use their alpha
+	 * channel; fully opaque images fall back to "pixels that differ noticeably from the border
+	 * colour", so a subject on a flat white/black backdrop is still found instead of the whole
+	 * frame. Returns false (and a full-frame rect) when no subject can be told apart, so the UI
+	 * can fall back to manual cropping rather than crop at random.
+	 */
+	static bool AutoCropRect(const FColor* Pixels, int32 Width, int32 Height, int32& OutMinX,
+		int32& OutMinY, int32& OutMaxX, int32& OutMaxY);
 
 	/**
 	 * Per-block downsampled "reference" colors of the imported image (NOT palette
